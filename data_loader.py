@@ -16,18 +16,12 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
+import config
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Пути и константы
 # ──────────────────────────────────────────────────────────────────────────────
-_PPD_FILE   = Path("Data/Параметры ППД вынгапур 2.0.xlsx")
-_OIL_FILE   = Path("Data/Параметры нефтяной вынгапур 2.0.xlsx")
-_COORD_FILE = Path("Data/Координаты2.0.xlsx")
 
-WINDOW_DAYS = 7
-GAP_LIMIT   = 2
-MIN_WORK_Q  = 40.0
-FREQ_THRESH = 41.0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Вспомогательные утилиты
@@ -60,7 +54,7 @@ def _read_excel(path: Path, rename_map: Mapping[str, str]) -> pd.DataFrame:
     return df
 
 
-def _interpolate_short_gaps(s: pd.Series, limit: int = GAP_LIMIT) -> pd.Series:
+def _interpolate_short_gaps(s: pd.Series, limit: int = config.GAP_LIMIT) -> pd.Series:
     return (
         s.astype(float)
         .interpolate(limit=limit, limit_area="inside")
@@ -72,7 +66,7 @@ def _interpolate_short_gaps(s: pd.Series, limit: int = GAP_LIMIT) -> pd.Series:
 # ──────────────────────────────────────────────────────────────────────────────
 def load_ppd(path: str | Path | None = None,
              wells: Optional[Iterable[str]] = None) -> pd.DataFrame:
-    path = Path(path or _PPD_FILE)
+    path = Path(path or config.PPD_FILE)
     df = _read_excel(path, {
         "Дата": "date", "№ скважины": "well",
         "Qприем.Тех": "q_ppd", "Pкуст": "p_cust",
@@ -89,10 +83,10 @@ def load_ppd(path: str | Path | None = None,
         grp["field"] = grp["field"].bfill().ffill()
 
         glitch = (grp["q_ppd"].eq(0)) & (grp["p_cust"] > 0)
-        roll   = grp["q_ppd"].replace(0, np.nan).rolling(WINDOW_DAYS, 1).mean()
+        roll   = grp["q_ppd"].replace(0, np.nan).rolling(config.WINDOW_DAYS, 1).mean()
         grp.loc[glitch, "q_ppd"] = roll[glitch]
 
-        no_press = grp["p_cust"].fillna(0).eq(0) & grp["q_ppd"].lt(MIN_WORK_Q)
+        no_press = grp["p_cust"].fillna(0).eq(0) & grp["q_ppd"].lt(config.MIN_WORK_PPD)
         grp.loc[no_press, "q_ppd"] = 0.0
 
         grp["q_ppd"] = _interpolate_short_gaps(grp["q_ppd"]).fillna(0)
@@ -108,7 +102,7 @@ def load_ppd(path: str | Path | None = None,
 # ──────────────────────────────────────────────────────────────────────────────
 def load_oil(path: str | Path | None = None,
              wells: Optional[Iterable[str]] = None) -> pd.DataFrame:
-    path = Path(path or _OIL_FILE)
+    path = Path(path or config.OIL_FILE)
     df = _read_excel(path, {
         "Дата": "date", "№ скважины": "well",
         "Qж": "q_oil", "Рприем": "p_oil",
@@ -127,8 +121,8 @@ def load_oil(path: str | Path | None = None,
         grp[["q_oil", "p_oil", "freq"]] = grp[["q_oil", "p_oil", "freq"]].astype(float)
         grp["field"] = grp["field"].bfill().ffill()
 
-        glitch = grp["q_oil"].eq(0) & grp["freq"].ge(FREQ_THRESH)
-        roll   = grp["q_oil"].replace(0, np.nan).rolling(WINDOW_DAYS, 1).mean()
+        glitch = grp["q_oil"].eq(0) & grp["freq"].ge(config.FREQ_THRESH)
+        roll   = grp["q_oil"].replace(0, np.nan).rolling(config.WINDOW_DAYS, 1).mean()
         grp.loc[glitch, "q_oil"] = roll[glitch]
 
         grp["p_oil"] = _interpolate_short_gaps(grp["p_oil"]).fillna(0)
@@ -143,7 +137,7 @@ def load_oil(path: str | Path | None = None,
 # COORDS
 # ──────────────────────────────────────────────────────────────────────────────
 def load_coords(path: str | Path | None = None) -> pd.DataFrame:
-    path = Path(path or _COORD_FILE)
+    path = Path(path or config.COORD_FILE)
     df = pd.read_excel(path).rename(columns={"Скважина": "well", "X": "x", "Y": "y"})
     return df[["well", "x", "y"]]
 
