@@ -1,76 +1,85 @@
 import pandas as pd
+from typing import List, Dict
 from config import PPD_BASELINE_DAYS, PPD_REL_THRESH, PPD_MIN_EVENT_DAYS
-
 
 def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Detect PPD percentage-drop events in PPD data.
+    Обнаружение событий PPD с динамической сменой режима (baseline).
 
-    Parameters
-    ----------
-    ppd_df : pd.DataFrame
-        DataFrame with columns ['date', 'well', 'q_ppd'], where 'date' is datetime-like.
+    Алгоритм для каждой скважины:
+    1. Инициализация baseline = медиана первых PPD_BASELINE_DAYS значений q_ppd.
+    2. Проход по датам: если |q - baseline|/baseline >= порог — старт события.
+       - Накопить подряд дни, пока условие верно.
+       - Если длительность >= PPD_MIN_EVENT_DAYS, зафиксировать событие:
+         * baseline_before
+         * baseline_during = медиана q внутри события
+         * min_q, max_q, relative_change_max
+       - Обновить baseline = baseline_during
+    3. Если после завершения события нет нового события >= PPD_BASELINE_DAYS дней подряд,
+       пересчитать baseline = медиана последних PPD_BASELINE_DAYS значений q_ppd до текущей даты.
+    4. Продолжить до конца ряда.
 
-    Returns
-    -------
-    events_df : pd.DataFrame
-        DataFrame of detected events with columns:
-        ['well', 'start_date', 'end_date', 'duration_days', 'baseline', 'min_q', 'relative_drop']
+    Возвращает DataFrame событий с колонками:
+    ['well', 'start_date', 'end_date', 'duration_days',
+     'baseline_before', 'baseline_during', 'min_q', 'max_q', 'relative_change']
     """
-    events = []
+    events: List[Dict] = []
 
-    # Ensure date column is datetime and sorted
-    ppd_df = ppd_df.copy()
-    ppd_df['date'] = pd.to_datetime(ppd_df['date'])
+    for well, grp in ppd_df.groupby('well'):
+        series = grp.sort_values('date').set_index('date')['q_ppd']
+        dates = series.index.to_list()
+        values = series.values.tolist()
+        n = len(dates)
+        i = PPD_BASELINE_DAYS  # начнём с дня, следующего после первых PPD_BASELINE_DAYS точек
+        # initial baseline_before: median of first PPD_BASELINE_DAYS
+        baseline = pd.Series(values[:PPD_BASELINE_DAYS]).median()
+        last_event_end_idx = PPD_BASELINE_DAYS - 1
 
-    for well, group in ppd_df.groupby('well'):
-        df = group.sort_values('date').set_index('date')
-
-        # Calculate rolling baseline excluding current day
-        baseline = df['q_ppd'] \
-            .rolling(window=PPD_BASELINE_DAYS, min_periods=PPD_BASELINE_DAYS) \
-            .mean().shift(1)
-        df['baseline'] = baseline
-
-        # Relative drop: fraction below baseline
-        df['relative_drop'] = 1 - df['q_ppd'] / df['baseline']
-
-        # Identify where the drop exceeds threshold
-        df['is_event'] = df['relative_drop'] >= PPD_REL_THRESH
-
-        # Label contiguous runs of events
-        df['event_group'] = (df['is_event'] != df['is_event'].shift(1)).cumsum()
-
-        # Iterate over each event run
-        for grp, sub in df[df['is_event']].groupby('event_group'):
-            start = sub.index.min()
-            end = sub.index.max()
-            duration = (end - start).days + 1
-
-            # Check minimum duration
-            if duration >= PPD_MIN_EVENT_DAYS :
-                baseline_val = sub['baseline'].iloc[0]
-                min_q = sub['q_ppd'].min()
-                rel_drop_val = sub['relative_drop'].max()
-
-                events.append({
-                    'well': well,
-                    'start_date': start,
-                    'end_date': end,
-                    'duration_days': duration,
-                    'baseline': baseline_val,
-                    'min_q': min_q,
-                    'relative_drop': rel_drop_val
-                })
+        while i < n:
+            q = values[i]
+            rel = abs(q - baseline) / baseline if baseline > 0 else 0.0
+            # старт нового события?
+            if rel >= PPD_REL_THRESH:
+                start_idx = i
+                window_vals = [q]
+                rel_vals = [rel]
+                i += 1
+                # накапливаем подряд дни события
+                while i < n:
+                    q_i = values[i]
+                    rel_i = abs(q_i - baseline) / baseline if baseline > 0 else 0.0
+                    if rel_i < PPD_REL_THRESH:
+                        break
+                    window_vals.append(q_i)
+                    rel_vals.append(rel_i)
+                    i += 1
+                end_idx = i - 1
+                duration = end_idx - start_idx + 1
+                # подтверждаем событие по длительности
+                if duration >= PPD_MIN_EVENT_DAYS:
+                    med_during = pd.Series(window_vals).median()
+                    events.append({
+                        'well':            well,
+                        'start_date':      dates[start_idx],
+                        'end_date':        dates[end_idx],
+                        'duration_days':   duration,
+                        'baseline_before': baseline,
+                        'baseline_during': med_during,
+                        'min_q':           min(window_vals),
+                        'max_q':           max(window_vals),
+                        'relative_change': max(rel_vals),
+                    })
+                    # обновляем baseline режим
+                    baseline = med_during
+                    last_event_end_idx = end_idx
+                    continue
+                # иначе шум — игнорируем и продолжаем с i
+            # если не событие — проверяем, не пора ли переподсчитать baseline
+            if i - last_event_end_idx >= PPD_BASELINE_DAYS:
+                # пересчёт baseline из последних PPD_BASELINE_DAYS точек до idx i
+                window_start = i - PPD_BASELINE_DAYS
+                baseline = pd.Series(values[window_start:i]).median()
+                last_event_end_idx = i - 1
+            i += 1
 
     return pd.DataFrame(events)
-
-
-if __name__ == '__main__':
-
-    try:
-        df = pd.read_csv('clean_data/ppd_clean.csv')
-        events = detect_ppd_events(df)
-        print(events.head())
-    except Exception:
-        pass
