@@ -9,6 +9,7 @@ COORD_FILE    = Path("Data/Координаты2.0.xlsx")
 GAP_LIMIT     = 5       # дней для интерполяции
 FREQ_THRESH   = 41.0    # порог частоты для шумовых Q=0
 MIN_WORK_PPD = 30    # порог шумовых замеров
+NO_PRESS_WITH_Q_LIMIT = 80
 
 # Детекция PPD-событий
 PPD_BASELINE_DAYS    = 30      # окно для базовой линии
@@ -24,3 +25,7 @@ MAX_EVENT_DAYS       = 30      # общий предел длины событи
 # Метрики импакта
 IMPACT_Q_DIVISOR     = 15.0
 IMPACT_P_DIVISOR     = 5.0
+
+PPD_SHEET_NAME = "Скважины"
+
+OIL_SHEET_NAME = "Скважины"
