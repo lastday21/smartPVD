@@ -193,5 +193,4 @@ def build_clean_files() -> None:
 
 if __name__ == "__main__":
     build_clean_files()
-    oil_raw = load_oil()
-    print(">>> Oil raw columns:", oil_raw.columns.tolist())
+

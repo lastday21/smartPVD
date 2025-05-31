@@ -1,5 +1,3 @@
-# tests/test_ppd_event_report.py
-
 import pandas as pd
 from pathlib import Path
 import pytest
@@ -51,7 +49,6 @@ def test_ppd_event_report_for_well_575():
 
     # Читаем очищенные данные
     ppd_df = pd.read_csv(PPD_CSV, parse_dates=['date'])
-    # Убедимся, что столбец well — int
     ppd_df['well'] = ppd_df['well'].astype(int)
 
     # Обнаруживаем события
@@ -67,14 +64,14 @@ def test_ppd_event_report_for_well_575():
     # 2) Правильные колонки
     expected = {
         'well', 'start_date', 'end_date', 'duration_days',
-        'baseline', 'min_q', 'max_q', 'relative_change'
+        'baseline_before', 'baseline_during', 'min_q', 'max_q', 'relative_change'
     }
-    miss = expected - set(events_well.columns)
-    assert not miss, f"В отчёте отсутствуют колонки: {miss}"
+    missing = expected - set(events_well.columns)
+    assert not missing, f"В отчёте отсутствуют колонки: {missing}"
     # 3) Файлы созданы
-    assert (REPORT_DIR / "ppd_events_575.csv").exists()
-    assert (REPORT_DIR / "ppd_events_575.md").exists()
-    assert (REPORT_DIR / "ppd_events_575.xlsx").exists()
+    assert (REPORT_DIR / "ppd_events_575.csv").exists(),  "CSV-отчёт не создан"
+    assert (REPORT_DIR / "ppd_events_575.md").exists(),   "MD-отчёт не создан"
+    assert (REPORT_DIR / "ppd_events_575.xlsx").exists(), "XLSX-отчёт не создан"
 
 
 if __name__ == '__main__':
@@ -92,11 +89,9 @@ if __name__ == '__main__':
     # И выводим Markdown-таблицу в консоль
     pd.set_option('display.expand_frame_repr', False)
     print("\nPPD-события для скважины 575:\n")
-    # тут вручную печатаем первые 10 строк
     headers = list(events_well.columns)
     print("| " + " | ".join(headers) + " |")
     print("| " + " | ".join(["---"] * len(headers)) + " |")
     for _, row in events_well.head(10).iterrows():
-        vals = [row[h] for h in headers]
-        str_vals = ["" if pd.isna(v) else str(v) for v in vals]
-        print("| " + " | ".join(str_vals) + " |")
+        vals = ["" if pd.isna(row[h]) else str(row[h]) for h in headers]
+        print("| " + " | ".join(vals) + " |")

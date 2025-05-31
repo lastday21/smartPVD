@@ -12,7 +12,7 @@ MIN_WORK_PPD = 30    # порог шумовых замеров
 NO_PRESS_WITH_Q_LIMIT = 80
 
 # Детекция PPD-событий
-PPD_BASELINE_DAYS    = 30      # окно для базовой линии
+PPD_WINDOW_SIZE     = 30      # окно для базовой линии
 PPD_REL_THRESH       = 0.20    # падение ≥20%
 PPD_MIN_EVENT_DAYS  = 7       #сколько минимум дней должно держаться событие
 
