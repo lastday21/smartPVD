@@ -249,6 +249,6 @@ if __name__ == "__main__":
     events_df = detect_ppd_events(ppd_df)
 
     # Сохраняем результат в «ppd_events.csv» рядом с этим скриптом
-    output_path = "ppd_events.csv"
+    output_path = "clean_data/ppd_events.csv"
     events_df.to_csv(output_path, index=False)
     print(f"Обнаружено событий: {len(events_df)}. Сохранено в файл: {output_path}")
