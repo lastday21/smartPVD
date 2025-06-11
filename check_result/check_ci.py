@@ -27,7 +27,7 @@ for col in ("well", "ppd_well"):
     ci[col] = ci[col].astype(str).str.strip()
 
 # ──────────────────────── суммируем CI_none ───────────────────────────
-agg = ci.groupby(["well", "ppd_well"], as_index=False)["CI_none"].sum().round(1)
+agg = ci.groupby(["well", "ppd_well"], as_index=False)["CI_none"].sum().round(3)
 
 # ──────────────────────── объединяем с GT ─────────────────────────────
 df = agg.merge(gt, on=["well", "ppd_well"], how="inner")
@@ -66,7 +66,6 @@ summary = pd.DataFrame([{
 }])
 df_report = pd.concat([df_report, summary], ignore_index=True)
 df_report.to_csv(OUT_REPORT, index=False)
-
 
 
 # ──────────────────────── вывод в консоль ─────────────────────────────
