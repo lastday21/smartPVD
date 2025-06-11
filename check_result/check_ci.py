@@ -1,52 +1,74 @@
+#!/usr/bin/env python
 """
-check_ci.py
-
-Скрипт для проверки CI-результатов против ground_truth.csv.
-
-1. Читает clean_data/ci_results_pro.csv с колонками:
-   well, ppd_well, CI_none, CI_mean, CI_regression, CI_median_ewma
-2. Суммирует каждый из CI_* по паре (well, ppd_well)
-3. Округляет сумму до целых
-4. Сравнивает результаты с разметкой из ground_truth.csv (колонки well, ppd_well, expected, acceptable)
-5. Выводит ci_check_pro_report.csv с колонками:
-   well, ppd_well, CI_none, CI_mean, CI_regression, CI_median_ewma, expected, acceptable
-
-Использование:
-    python check_ci.py
+check_result/check_ci.py
+Сверяем CI с ground_truth и формируем один отчёт ci_check_report.csv.
 """
-import pandas as pd
 
-# 1. Загрузка ground truth из CSV
-gt_df = pd.read_csv("ground_truth.csv", dtype=str)
-gt_df['acceptable'] = gt_df['acceptable'].str.split(';')
+import pandas as pd, config
+from pathlib import Path
 
-# 2. Загрузка CI результатов
-ci_df = pd.read_csv(
-    "../clean_data/ci_results_pro.csv",
-    dtype={"well": str, "ppd_well": str}
+# ──────────────────────── расположение файлов ─────────────────────────
+ROOT         = Path(__file__).resolve().parents[1]      # <проект>/…
+GROUND_TRUTH = ROOT / "ground_truth.csv"
+CI_RESULTS   = ROOT / "clean_data" / "ci_results.csv"
+OUT_REPORT   = Path(__file__).with_name("ci_check_report.csv")
+
+# ──────────────────────── загрузка данных ─────────────────────────────
+gt = pd.read_csv(GROUND_TRUTH, dtype=str)
+gt["acceptable"] = gt["acceptable"].fillna("").apply(
+    lambda s: [x.strip() for x in s.split(";")] if s else []
 )
 
-# 3. Суммируем каждый CI_* по паре
-sum_df = ci_df.groupby(["well","ppd_well"], as_index=False).agg({
-    'CI_none': 'sum',
-    'CI_mean': 'sum',
-    'CI_regression': 'sum',
-    'CI_median_ewma': 'sum'
-})
+ci = pd.read_csv(CI_RESULTS, dtype={"well": str, "ppd_well": str})
 
-# 4. Округляем суммы до целых
-for col in ['CI_none','CI_mean','CI_regression','CI_median_ewma']:
-    sum_df[col] = sum_df[col].round(0).astype(int)
+# чистим пробелы в ключах
+for col in ("well", "ppd_well"):
+    gt[col] = gt[col].astype(str).str.strip()
+    ci[col] = ci[col].astype(str).str.strip()
 
-# 5. Мёрджим с разметкой
-df_report = sum_df.merge(gt_df, on=['well','ppd_well'], how='inner')
+# ──────────────────────── суммируем CI_none ───────────────────────────
+agg = ci.groupby(["well", "ppd_well"], as_index=False)["CI_none"].sum().round(1)
 
-# 6. Сохраняем итоговый отчет
-report_cols = [
-    'well','ppd_well',
-    'CI_none','CI_mean','CI_regression','CI_median_ewma',
-    'expected','acceptable'
-]
-df_report.to_csv("ci_check_pro_report.csv", index=False, columns=report_cols)
+# ──────────────────────── объединяем с GT ─────────────────────────────
+df = agg.merge(gt, on=["well", "ppd_well"], how="inner")
 
-print("ci_check_pro_report.csv создан с результатами проверки.")
+# ──────────────────────── категория CI ────────────────────────────────
+try:                       # пробуем забрать функцию из config
+    categorize = config.categorize
+except AttributeError:     # иначе строим на основе порогов в конфиге
+    T1, T2, T3 = getattr(config, "CI_THRESHOLDS", (2, 4, 6))
+    def categorize(ci):
+        return ("none", "weak", "medium", "strong")[
+            0 if ci < T1 else 1 if ci < T2 else 2 if ci < T3 else 3
+        ]
+
+df["pred_cat"] = df["CI_none"].apply(categorize)
+
+# ──────────────────────── считаем метрики ─────────────────────────────
+exact     = (df["pred_cat"] == df["expected"]).sum()
+off_by_1  = sum(df.apply(lambda r: r["pred_cat"] in r["acceptable"], axis=1))
+miss      = len(df) - exact - off_by_1
+total     = len(df)
+
+# ──────────────────────── формируем отчёт ─────────────────────────────
+report_cols = ["well", "ppd_well", "CI_none", "expected", "acceptable"]
+df_report   = df[report_cols].copy()
+
+accuracy = round((exact + off_by_1) / total, 2)
+
+# дописываем строку-итог
+summary = pd.DataFrame([{
+    "well":        "TOTALS",
+    "ppd_well":    config.distance_mode,            # exp / linear
+    "CI_none":     f"exact={exact}",
+    "expected":    f"off={off_by_1};",
+    "acceptable":  f"miss={miss};all={total}, accuracy={accuracy}"
+}])
+df_report = pd.concat([df_report, summary], ignore_index=True)
+df_report.to_csv(OUT_REPORT, index=False)
+
+
+
+# ──────────────────────── вывод в консоль ─────────────────────────────
+print(f"{exact},{off_by_1},{miss},{total}, точность {accuracy}")
+
