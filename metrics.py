@@ -1,6 +1,4 @@
 """
-metrics.py
-═══════════════════════════════════════════════════════════════════════════════
 Этот модуль выполняет расчёт Confidence Index (CI) для каждого окна «до/после»
 ППД-мероприятия и сохраняет результат в clean_data/ci_results_pro.csv.
 
@@ -77,7 +75,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ──────────────────────── кеш CSV ────────────────────────────────
 _cached = {}
-
 def _load_csvs(dir_: str, ow: str, ppd: str, oc: str):
     """Чтение и кеширование исходных файлов + расстояния."""
     key = (dir_, ow, ppd, oc)
@@ -160,7 +157,7 @@ def compute_ci_with_pre(
         # baseline (как раньше)
         if need_bl and pre_df is not None:
             pre = pre_df[
-                (pre_df["date"] >= rec["oil_start"] - pd.Timedelta(days=config.pre_len)) &
+                (pre_df["date"] >= rec["oil_start"] - pd.Timedelta(days=config.T_pre)) &
                 (pre_df["date"] <  rec["oil_start"])
             ].query("q_oil>0 & p_oil>0")
             if len(pre) >= 5:

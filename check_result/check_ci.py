@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 check_result/check_ci.py
 Сверяем CI с ground_truth и формируем один отчёт ci_check_report.csv.
