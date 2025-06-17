@@ -1,146 +1,96 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-Этот модуль выполняет расчёт Confidence Index (CI) для каждого окна «до/после»
-ППД-мероприятия и сохраняет результат в clean_data/ci_results_pro.csv.
+metrics.py — расчёт Confidence Index (CI) для SmartPVD-MVP.
 
-Что читается:
--------------
-  1) clean_data/oil_windows.csv
-     - Окна наблюдений «до/после» ППД
-     - Столбцы: well, ppd_well, q_start, q_end, p_start, p_end, oil_start, oil_end, duration_days_oil
+Модуль читает файлы:
 
-  2) clean_data/ppd_events.csv
-     - Метаданные ППД-мероприятий
-     - Столбцы: well (P-скважина), start_date, baseline_before, baseline_during
+  clean_data/oil_windows.csv    — окна «до/после» ППД (well, ppd_well, q_start, q_end, p_start, p_end, oil_start, oil_end, duration_days_oil)
+  clean_data/ppd_events.csv     — события ППД (well, start_date, baseline_before, baseline_during)
+  clean_data/oil_clean.csv      — суточные ряды добычи (well, date, q_oil, p_oil)
+  clean_data/pairs_oil_ppd.csv  — пары скважин и расстояния (oil_well, ppd_well, distance)
+  clean_data/ground_truth.csv   — эталон (oil_well, ppd_well, expected, acceptable)
 
-  3) clean_data/oil_clean.csv
-     - Исторические суточные данные по дебиту и давлению
-     - Столбцы: well, date, q_oil, p_oil
-
-Как устроено:
--------------
-  • Все три CSV читаются и кешируются при первом вызове (каждый файл – однажды).
-  • oil_clean.csv дополнительно группируется по скважинам в словарь для быстрого доступа.
-  • Для каждой строки из oil_windows объединяется запись ППД, затем по “пред-окну” берутся
-    данные из oil_clean, и, при запросе, вызываются базовые методы из metrics_baseline.py.
-
-Основная функция:
------------------
-  compute_ci_with_pre(
-      clean_data_dir: str = "clean_data",
-      oil_windows_fname: str = "oil_windows.csv",
-      ppd_events_fname: str = "ppd_events.csv",
-      oil_clean_fname: str = "oil_clean.csv",
-      methods: tuple[str, ...] = ("none",),
-  ) -> pd.DataFrame
-
-  Параметр methods:
-    - "none"        – без базлайна (CI только по разнице Q/P);
-    - "mean"        – коррекция по среднему пред-окна;
-    - "regression"  – коррекция линейной регрессией;
-    - "median_ewma" – медиана + экспоненциальное сглаживание.
-
-  Возвращает DataFrame со строками:
-    №, well, ppd_well, deltaQpr, q_start, p_start, q_end, p_end,
-    duration_days_oil, oil_start, oil_end,
-    deltaQbaseCI_mean, deltaPbaseCI_mean,
-    deltaQbaseCI_regression, deltaPbaseCI_regression,
-    deltaQbaseCI_median_ewma, deltaPbaseCI_median_ewma,
-    CI_none, CI_mean, CI_regression, CI_median_ewma
-
-  Параллельных вычислений в этом модуле нет — он рассчитан на одиночный быстрый прогон.
-  Для полного перебора гиперпараметров используется отдельный скрипт hyperparam_search.py.
-
-Пример использования:
----------------------
-  import metrics
-
-  # только «грубый» CI
-  df = metrics.compute_ci_with_pre()
-
-  # с простым baseline-средним
-  df = metrics.compute_ci_with_pre(methods=("none","mean"))
-
-  # со всеми методами
-  df = metrics.compute_ci_with_pre(
-      methods=("none","mean","regression","median_ewma")
-  )
+Добавлен параметр filter_by_gt: если True, в detail_df и agg_df остаются только пары, присутствующие в GT.
+Логика расчёта CI не изменена.
 """
-
 from __future__ import annotations
-import os, math, warnings, importlib
-import pandas as pd, numpy as np
+import math, warnings, importlib
+from pathlib import Path
+from typing import Tuple
+
+import pandas as pd
+import numpy as np
+
 import config
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+_CSV_CACHE: dict = {}
 
-# ──────────────────────── кеш CSV ────────────────────────────────
-_cached = {}
-def _load_csvs(dir_: str, ow: str, ppd: str, oc: str):
-    """Чтение и кеширование исходных файлов + расстояния."""
-    key = (dir_, ow, ppd, oc)
-    if key in _cached:
-        return _cached[key]
-
-    # 1) окна + ппд (как было)
-    df_ow = pd.read_csv(os.path.join(dir_, ow))
+def _load_csvs(
+    clean_data_dir: str,
+    oil_windows_fname: str,
+    ppd_events_fname: str,
+    oil_clean_fname: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame], dict[tuple[str,str], float]]:
+    key = (clean_data_dir, oil_windows_fname, ppd_events_fname, oil_clean_fname)
+    if key in _CSV_CACHE:
+        return _CSV_CACHE[key]
+    base = Path(clean_data_dir)
+    df_ow = pd.read_csv(base / oil_windows_fname)
     df_ow["oil_start"] = pd.to_datetime(df_ow["oil_start"])
     df_ow["oil_end"]   = pd.to_datetime(df_ow["oil_end"])
     df_ow["ppd_start"] = pd.to_datetime(df_ow["ppd_start"])
 
-    df_ppd = pd.read_csv(os.path.join(dir_, ppd))
+    df_ppd = pd.read_csv(base / ppd_events_fname)
     df_ppd["start_date"] = pd.to_datetime(df_ppd["start_date"], dayfirst=True)
-    df_ppd["delta_PPD"]  = (
-        df_ppd["baseline_during"] - df_ppd["baseline_before"]
-    ).apply(lambda d: 1 if d > 0 else (-1 if d < 0 else 0))
-    df_ppd["deltaQpr"]   = df_ppd["baseline_during"] - df_ppd["baseline_before"]
+    df_ppd["delta_PPD"]  = df_ppd["baseline_during"] - df_ppd["baseline_before"]
+    df_ppd["deltaQpr"]   = df_ppd["delta_PPD"]
     df_ppd_min = (
         df_ppd[["well","start_date","delta_PPD","deltaQpr"]]
-          .rename(columns={"well":"ppd_well","start_date":"ppd_start"})
+               .rename(columns={"well":"ppd_well","start_date":"ppd_start"})
     )
 
-    # 2) oil_clean
-    df_clean = pd.read_csv(os.path.join(dir_, oc))
+    df_clean = pd.read_csv(base / oil_clean_fname)
     df_clean["date"] = pd.to_datetime(df_clean["date"], dayfirst=True, errors="coerce")
-    by_well = {
-        w: sub.sort_values("date")[["date","q_oil","p_oil"]]
-        for w, sub in df_clean.groupby("well")
-    }
+    clean_by_well = {w: sub.sort_values("date")[['date','q_oil','p_oil']] for w, sub in df_clean.groupby('well')}
 
-    # 3) пары расстояний
-    dist_path = os.path.join(dir_, "pairs_oil_ppd.csv")
-    df_dist = pd.read_csv(dist_path)
-    dist = {
-        (str(r.oil_well), str(r.ppd_well)): float(r.distance)
-        for _, r in df_dist.iterrows()
-    }
+    df_pairs = pd.read_csv(base / "pairs_oil_ppd.csv")
+    dist = {(str(r.oil_well), str(r.ppd_well)): float(r.distance) for _, r in df_pairs.iterrows()}
 
-    _cached[key] = (df_ow, df_ppd_min, by_well, dist)
-    return _cached[key]
+    _CSV_CACHE[key] = (df_ow, df_ppd_min, clean_by_well, dist)
+    return _CSV_CACHE[key]
 
-# ──────────────────────── формула CI ─────────────────────────────
-def _ci_value(dp, eps_q, eps_p):
+def _ci_value(dp: float, dq: float, dp_oil: float) -> float:
     if dp == 0:
         return 0.0
-    x = dp * (eps_q / config.divider_q)
-    y = dp * (eps_p / config.divider_p)
+    x = dp * (dq / config.divider_q)
+    y = dp * (dp_oil / config.divider_p)
     if x >= 0 and y >= 0:
         return config.w_q * x + config.w_p * y
-    if x >= 0 and y < 0:
+    if x >= 0:
         return x
-    if x < 0 and y >= 0:
+    if y >= 0:
         return y
     return 0.0
 
-# ──────────────────── публичная функция ─────────────────────────
 def compute_ci_with_pre(
-        clean_data_dir="clean_data",
-        oil_windows_fname="oil_windows.csv",
-        ppd_events_fname="ppd_events.csv",
-        oil_clean_fname="oil_clean.csv",
-        methods=("none",),
-):
-    need_bl = any(m != "none" for m in methods)
-    if need_bl:
+    clean_data_dir: str = "clean_data",
+    oil_windows_fname: str = "oil_windows.csv",
+    ppd_events_fname: str = "ppd_events.csv",
+    oil_clean_fname: str = "oil_clean.csv",
+    methods: tuple[str, ...] = ("none",),
+    save_csv: bool = False,
+    filter_by_gt: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Возвращает детальный и агрегированный отчёты по CI.
+
+    Параметры:
+      filter_by_gt: если True — оставляет только пары (oil_well,ppd_well) из ground_truth.
+    """
+    need_baseline = any(m != "none" for m in methods)
+    if need_baseline:
         get_baseline = importlib.import_module("metrics_baseline").get_baseline
 
     df_ow, df_ppd_min, clean_by_well, dist = _load_csvs(
@@ -148,72 +98,127 @@ def compute_ci_with_pre(
     )
     df = pd.merge(df_ow, df_ppd_min, on=["ppd_well","ppd_start"], how="left")
 
-    def process(row):
-        well, rec = row["well"], row
+    def _process(rec: pd.Series) -> pd.Series:
+        well = rec["well"]
         pre_df = clean_by_well.get(well)
-        dq_b = {"mean":0, "regression":0, "median_ewma":0}
+        dq_b = {m:0.0 for m in ("mean","regression","median_ewma")}
         dp_b = dq_b.copy()
-
-        # baseline (как раньше)
-        if need_bl and pre_df is not None:
-            pre = pre_df[
-                (pre_df["date"] >= rec["oil_start"] - pd.Timedelta(days=config.T_pre)) &
-                (pre_df["date"] <  rec["oil_start"])
-            ].query("q_oil>0 & p_oil>0")
+        if need_baseline and pre_df is not None:
+            pre = pre_df[(pre_df["date"] >= rec["oil_start"] - pd.Timedelta(days=config.T_pre)) &
+                         (pre_df["date"] < rec["oil_start"])].query("q_oil>0 & p_oil>0")
             if len(pre) >= 5:
                 for m in dq_b:
                     if m in methods:
                         dq_b[m], dp_b[m] = get_baseline(
-                            m, pre, q_start=rec["q_start"], p_start=rec["p_start"],
+                            m, pre,
+                            q_start=rec["q_start"], p_start=rec["p_start"],
                             oil_start=rec["oil_start"], oil_end=rec["oil_end"]
                         )
-
         dq_act = rec["q_end"] - rec["q_start"]
         dp_act = rec["p_end"] - rec["p_start"]
         ci = {"CI_none": _ci_value(rec["delta_PPD"], dq_act, dp_act)}
         if "mean" in methods:
-            ci["CI_mean"] = _ci_value(rec["delta_PPD"],
-                                      dq_act-dq_b["mean"], dp_act-dp_b["mean"])
+            ci["CI_mean"] = _ci_value(rec["delta_PPD"], dq_act - dq_b["mean"], dp_act - dp_b["mean"])
         if "regression" in methods:
-            ci["CI_regression"] = _ci_value(rec["delta_PPD"],
-                                            dq_act-dq_b["regression"], dp_act-dp_b["regression"])
+            ci["CI_regression"] = _ci_value(rec["delta_PPD"], dq_act - dq_b["regression"], dp_act - dp_b["regression"])
         if "median_ewma" in methods:
-            ci["CI_median_ewma"] = _ci_value(rec["delta_PPD"],
-                                             dq_act-dq_b["median_ewma"], dp_act-dp_b["median_ewma"])
-
-        # ─── модификатор расстояния ───
-        d = dist.get((str(well), str(rec["ppd_well"])))
+            ci["CI_median_ewma"] = _ci_value(rec["delta_PPD"], dq_act - dq_b["median_ewma"], dp_act - dp_b["median_ewma"])
+        d = dist.get((str(well), str(rec["ppd_well"])) )
         if d is not None:
-            if config.distance_mode == "linear":
-                atten = max(0.0, 1 - d / config.lambda_dist)
-            else:
-                atten = math.exp(-d / config.lambda_dist)
+            atten = (max(0.0, 1 - d/config.lambda_dist) if config.distance_mode == "linear" else math.exp(-d/config.lambda_dist))
             for k in ci:
                 ci[k] *= atten
-
-        # round & return
-        out = {
-            "deltaQpr": rec["deltaQpr"],
-            "q_start": rec["q_start"], "p_start": rec["p_start"],
-            "q_end": rec["q_end"],     "p_end": rec["p_end"],
+        out = {k: round(v,1) for k,v in ci.items()}
+        out.update({
+            "deltaQpr": rec["deltaQpr"], "q_start": rec["q_start"], "p_start": rec["p_start"],
+            "q_end": rec["q_end"], "p_end": rec["p_end"],
             "duration_days_oil": rec.get("duration_days_oil", np.nan),
             "oil_start": rec["oil_start"], "oil_end": rec["oil_end"],
-            "deltaQbaseCI_mean": round(dq_b["mean"],1),
-            "deltaPbaseCI_mean": round(dp_b["mean"],1),
-            "deltaQbaseCI_regression": round(dq_b["regression"],1),
-            "deltaPbaseCI_regression": round(dp_b["regression"],1),
-            "deltaQbaseCI_median_ewma": round(dq_b["median_ewma"],1),
-            "deltaPbaseCI_median_ewma": round(dp_b["median_ewma"],1),
-        }
-        out.update({k: round(v,1) for k,v in ci.items()})
+            "well": well, "ppd_well": rec["ppd_well"]
+        })
         return pd.Series(out)
 
-    res = df.assign(**df.apply(process, axis=1))
-    res = res.sort_values(["well","ppd_well"]).reset_index(drop=True)
-    res.insert(0, "№", range(1, len(res)+1))
-    res.to_csv(os.path.join(clean_data_dir, "ci_results.csv"),
-               index=False, float_format="%.1f")
-    return res
+    detail_df = df.assign(**df.apply(_process, axis=1))
+    detail_df = detail_df.sort_values(["well","ppd_well"]).reset_index(drop=True)
+    detail_df.insert(0, "№", range(1, len(detail_df)+1))
+
+    agg_df = (
+        detail_df.groupby(["well","ppd_well"], as_index=False)["CI_none"]
+                 .sum()
+                 .rename(columns={"well":"oil_well","ppd_well":"ppd_well","CI_none":"CI_value"})
+    )
+    agg_df["CI_value"] = agg_df["CI_value"].round(1)
+    agg_df["oil_well"] = agg_df["oil_well"].astype(str)
+    agg_df["ppd_well"] = agg_df["ppd_well"].astype(str)
+
+    t1, t2, t3 = config.CI_THRESHOLDS
+    agg_df["ci_cat"] = agg_df["CI_value"].apply(
+        lambda v: ("none","weak","medium","strong")[0 if v<t1 else 1 if v<t2 else 2 if v<t3 else 3]
+    )
+
+    # объединение с эталоном и фильтрация
+    gt_path = Path(clean_data_dir)/"ground_truth.csv"
+    if not gt_path.exists():
+        gt_path = Path("start_data")/"ground_truth.csv"
+    if gt_path.exists():
+        gt = pd.read_csv(gt_path, dtype=str)
+        if "well" in gt.columns:
+            gt = gt.rename(columns={"well":"oil_well"}, errors="ignore")
+        for c in ("oil_well","ppd_well"): gt[c] = gt[c].astype(str)
+        gt_pairs = set(zip(gt["oil_well"], gt["ppd_well"]))
+        # добавляем GT-колонки
+        agg_df = agg_df.merge(gt[["oil_well","ppd_well","expected","acceptable"]],
+                              on=["oil_well","ppd_well"], how="left")
+        # подготовка detail_df: строковые ключи
+        detail_df["oil_well"] = detail_df["well"].astype(str)
+        detail_df["ppd_well"] = detail_df["ppd_well"].astype(str)
+        detail_df = detail_df.merge(
+            agg_df[["oil_well","ppd_well"]],
+            on=["oil_well","ppd_well"], how="inner"
+        )
+        if filter_by_gt:
+            agg_df = agg_df[agg_df.apply(lambda r: (r["oil_well"],r["ppd_well"]) in gt_pairs, axis=1)]
+            detail_df = detail_df[detail_df.apply(lambda r: (r["oil_well"],r["ppd_well"]) in gt_pairs, axis=1)]
+    else:
+        agg_df = agg_df.iloc[0:0]
+        detail_df = detail_df.iloc[0:0]
+
+    if save_csv:
+        detail_path = Path(clean_data_dir)/"ci_results.csv"
+        agg_path    = Path(clean_data_dir)/"ci_results_agg.csv"
+        detail_df.to_csv(detail_path, index=False, encoding="utf-8-sig")
+        agg_df.to_csv(agg_path,    index=False, encoding="utf-8-sig")
+
+        total = len(agg_df)
+        # точные совпадения
+        exact = int(((agg_df["expected"]!="") & (agg_df["ci_cat"]==agg_df["expected"])).sum())
+        # «nearby» – допустимые (acceptable), но не точные
+        acc_lists = agg_df["acceptable"].fillna("").apply(lambda s: [x.strip() for x in s.split(";")] if s else [])
+        nearby = int(sum((exp!="") and (cat!=exp) and (cat in acc) for exp,cat,acc in zip(
+            agg_df["expected"], agg_df["ci_cat"], acc_lists)))
+        # промахи (категории ни в expected, ни в acceptable)
+        miss = total - exact - nearby
+        # точность учитывает точные и «nearby»
+        accuracy = (exact + nearby)/total if total else 0.0
+
+        totals_line = (f"TOTALS,exact={exact},nearby={nearby},miss={miss},"
+                       f"all={total},accuracy={accuracy:.2f}")
+
+        for p in (detail_path, agg_path):
+            with open(p, "a", encoding="utf-8-sig") as f:
+                f.write(f"{totals_line}")
+        print(f"[CI] ✔ сохранено {detail_path} и {agg_path}")
+
+    return detail_df, agg_df
 
 if __name__ == "__main__":
-    compute_ci_with_pre(methods=("none",))
+    print("[CI] ▶ расчёт…")
+    compute_ci_with_pre(
+        clean_data_dir="clean_data",
+        oil_windows_fname="oil_windows.csv",
+        ppd_events_fname="ppd_events.csv",
+        oil_clean_fname="oil_clean.csv",
+        methods=("none",),
+        save_csv=True,
+        filter_by_gt=True,
+    )

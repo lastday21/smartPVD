@@ -8,7 +8,7 @@ from pathlib import Path
 
 # ──────────────────────── расположение файлов ─────────────────────────
 ROOT         = Path(__file__).resolve().parents[1]      # <проект>/…
-GROUND_TRUTH = ROOT / "ground_truth.csv"
+GROUND_TRUTH = ROOT / "start_data" / "ground_truth.csv"
 CI_RESULTS   = ROOT / "clean_data" / "ci_results.csv"
 OUT_REPORT   = Path(__file__).with_name("ci_check_report.csv")
 

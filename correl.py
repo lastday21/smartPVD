@@ -240,25 +240,34 @@ def calc_corr(
     ]
     corr_df = feat[out_cols]
 
-    exact = (corr_df["expected"] != "") & (corr_df["corr_cat"] == corr_df["expected"])
-    off   = (corr_df["expected"] != "") & (~corr_df.apply(
-        lambda r: r.corr_cat in r.acceptable.split(";"), axis=1
+    total = len(corr_df)
+    # точные совпадения
+    exact = int(((corr_df["expected"] != "") & (corr_df["corr_cat"] == corr_df["expected"])).sum())
+    # «nearby» – допустимые (acceptable), но не точные
+    acc_lists = corr_df["acceptable"].fillna("").apply(
+        lambda s: [x.strip() for x in s.split(";")] if s else []
+    )
+    nearby = int(sum(
+        (exp != "") and (cat != exp) and (cat in acc)
+        for exp, cat, acc in zip(corr_df["expected"], corr_df["corr_cat"], acc_lists)
     ))
-    miss  = len(corr_df) - exact.sum() - off.sum()
+    # промахи
+    miss = total - exact - nearby
+    # точность учитывает exact + nearby
+    accuracy = (exact + nearby) / total if total else 0.0
 
-    totals = pd.DataFrame([
-        {
-            "oil_well":   "TOTALS",
-            "ppd_well":   "",
-            "corr_cat":   "",
-            "abs_corr":   f"exact={exact.sum()}",
-            "n_events":   f"miss={miss}",
-            "event_corr": f"all={len(corr_df)}",
-            "ccf_corr":   f"accuracy={exact.mean():.2f}" if len(corr_df) else "",
-            "expected":   "",
-            "acceptable": f"off={off.sum()}",
-        }
-    ])
+    totals = pd.DataFrame([{
+        "oil_well": "TOTALS",
+        "ppd_well": "",
+        "corr_cat": "",
+        "abs_corr": f"exact={exact}",
+        "n_events": f"nearby={nearby}",
+        "event_corr": f"miss={miss}",
+        "ccf_corr": f"all={total}",
+        "expected": f"accuracy={accuracy:.2f}",
+        "acceptable": ""
+    }])
+
     return pd.concat([corr_df, totals], ignore_index=True)
 
 
