@@ -360,14 +360,14 @@ def build_clean_data(*, save_csv: bool = False):
         out_ppd.insert(0, "№ п/п", range(1, len(out_ppd)+1))
         out_ppd = out_ppd.rename(columns={"cluster":"Куст"})
         out_ppd["date"] = pd.to_datetime(out_ppd["date"], dayfirst=False).dt.strftime("%d.%m.%Y")
-        out_ppd.to_csv(CLEAN_DIR/"ppd_clean1.csv", index=False, encoding="utf-8-sig")
+        out_ppd.to_csv(CLEAN_DIR/"ppd_clean.csv", index=False, encoding="utf-8-sig")
 
         out_oil = (oil_daily.merge(meta_oil, on="well", how="left")
                              [["field","well","cluster","date","q_oil","water_cut","p_oil","freq","t_work"]])
         out_oil.insert(0, "№ п/п", range(1, len(out_oil)+1))
         out_oil = out_oil.rename(columns={"cluster":"Куст","water_cut":"watercut","t_work":"Tраб(ТМ)"})
         out_oil["date"] = pd.to_datetime(out_oil["date"], dayfirst=False).dt.strftime("%d.%m.%Y")
-        out_oil.to_csv(CLEAN_DIR/"oil_clean1.csv", index=False, encoding="utf-8-sig")
+        out_oil.to_csv(CLEAN_DIR/"oil_clean.csv", index=False, encoding="utf-8-sig")
 
         coords.to_csv(CLEAN_DIR/"coords_clean.csv", index=False, encoding="utf-8-sig")
         print("✓ CSV‑файлы сохранены →", CLEAN_DIR.resolve())

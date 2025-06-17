@@ -1,156 +1,170 @@
+
+"""
+Что делает модуль
+-----------------
+1. Принимает суточный DataFrame *ppd_df* с колонками
+   «well, date, q_ppd» (расход) и, опционально, «p_cust» (кустовое давление).
+2. Для каждой скважины ищет периоды резкого отклонения дебита («dev-дни»)
+   относительно скользящего baseline.
+3. Когда накапливается серия из **PPD_MIN_EVENT_DAYS** подряд dev-дней,
+   фиксируется начало события; окончание определяется аналогично.
+4. Для каждого события рассчитываются:
+   – *baseline_before* (дебит до события)
+   – *baseline_during* (дебит по ходу события)
+   – *min_q* / *max_q*  экстремумы внутри события
+   – *duration_days*   длительность события
+   Все четыре показателя округляются до целого `int`.
+5. Возвращает DataFrame **ppd_events** со столбцами
+   `['well','start_date','end_date','baseline_before','baseline_during',
+     'min_q','max_q','duration_days']`.
+
+Константы `PPD_REL_THRESH`, `PPD_MIN_EVENT_DAYS`, `PPD_WINDOW_SIZE`
+подтягиваются из *config.py* — они задают чувствительность алгоритма.
+
+Колонки на входе (`ppd_daily`):
+    well | date | q_ppd | … (остальные не используются)
+Колонки на выходе (`ppd_events`):
+    well, start_date, end_date,
+    baseline_before, baseline_during,
+    min_q, max_q, duration_days
+"""
+
 import os
-import pandas as pd
-import numpy as np
 from datetime import timedelta
+
+import numpy as np
+import pandas as pd
+
 from config import PPD_REL_THRESH, PPD_MIN_EVENT_DAYS, PPD_WINDOW_SIZE
+
 
 def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Обнаруживает события по PPD с учётом:
-    - скользящего окна (до PPD_WINDOW_SIZE) здоровых и dev-точек,
-    - фильтрации dev-точек скользящим средним внутри devs,
-    - накопления глобальных min/max внутри события,
-    - и приводит все числовые метрики (baseline_before, baseline_during, min_q, max_q) к целым.
+    Анализирует суточный ряд q_ppd каждой скважины и формирует таблицу событий.
 
-    Вход:
-        ppd_df: pd.DataFrame с колонками:
-            - 'well'  : идентификатор скважины
-            - 'date'  : pd.Timestamp или строка формата YYYY-MM-DD
-            - 'q_ppd' : float или int — измеренное значение PPD
+    Параметры
+    ----------
+    ppd_df : pd.DataFrame
+        Обязательные колонки:
+            • 'well'  – идентификатор скважины (str / int)
+            • 'date'  – дата измерения (pd.Timestamp или строка 'DD.MM.YYYY')
+            • 'q_ppd' – расход приёма, м³/сут (float / int)
 
-        Предполагается, что данные очищены:
-        нет NaN в 'q_ppd', даты корректны;
-        для каждой скважины есть записи последовательно по датам.
+        Предполагается, что данные уже очищены предобработкой:
+        даты валидны, NaN удалены, строки отсортированы по дате внутри каждой
+        скважины.
 
-    Выход:
-        pd.DataFrame со столбцами:
-          'well', 'start_date', 'end_date',
-          'baseline_before', 'baseline_during',
-          'min_q', 'max_q', 'duration_days'
-          где baseline_before, baseline_during, min_q, max_q — целые int.
+    Возвращает
+    ----------
+    pd.DataFrame
+        Столбцы:
+        'well', 'start_date', 'end_date',
+        'baseline_before', 'baseline_during',
+        'min_q', 'max_q', 'duration_days'
     """
-
-    # Убедимся, что столбец date в формате datetime
-    if not np.issubdtype(ppd_df['date'].dtype, np.datetime64):
+    # --- 0. Убедимся, что date – это datetime --------------------------------
+    if not np.issubdtype(ppd_df["date"].dtype, np.datetime64):
         ppd_df = ppd_df.copy()
-        ppd_df['date'] = pd.to_datetime(ppd_df['date'], dayfirst=True)
+        ppd_df["date"] = pd.to_datetime(ppd_df["date"], dayfirst=True)
 
     all_events = []
 
-    def compute_baseline(vals_list):
-        """Возвращает среднее по списку чисел, либо 0.0, если список пуст."""
-        return float(np.mean(vals_list)) if len(vals_list) > 0 else 0.0
+    def _mean(lst):
+        """Небольшой helper: среднее списка или 0.0, если список пуст."""
+        return float(np.mean(lst)) if lst else 0.0
 
-    # Группируем по каждой скважине
-    for well, group in ppd_df.groupby('well'):
-        dfw = group.sort_values('date').reset_index(drop=True)
-        dates = dfw['date'].tolist()
-        values = dfw['q_ppd'].tolist()
+    # --- 1. Проходим по всем скважинам ---------------------------------------
+    for well, group in ppd_df.groupby("well"):
+        dfw = group.sort_values("date").reset_index(drop=True)
+        dates = dfw["date"].tolist()
+        values = dfw["q_ppd"].tolist()
 
-        window = []     # FIFO: последние здоровые + начальные dev-точки (максимум PPD_WINDOW_SIZE)
-        devs = []       # подрядные dev-точки (фильтруемые скользящим средним внутри devs)
+        window = []      # скользящее окно (healthy + dev), макс. PPD_WINDOW_SIZE
+        devs = []        # подрядные dev-дни (фильтруются внутри цикла)
+
         in_event = False
         start_date = None
         baseline_before = None
         baseline_during = None
 
-        # Глобальные экстремумы (min/max) в пределах текущего события
         event_min = None
         event_max = None
 
         for today, q in zip(dates, values):
-            # 1) Вычисляем текущее baseline_during как среднее по window (или q, если window пуст)
-            if window:
-                baseline_during = compute_baseline([v for (_, v) in window])
-            else:
-                baseline_during = q
+            # 1.1 Текущий baseline_during = среднее по window
+            baseline_during = _mean([v for (_, v) in window]) if window else q
 
-            # 2) Вычисляем rel относительно baseline_during
+            # 1.2 Относительное отклонение от baseline
             if baseline_during == 0.0:
-                rel = 0.0 if q == 0.0 else float('inf')
+                rel = 0.0 if q == 0.0 else float("inf")
             else:
                 rel = abs(q - baseline_during) / baseline_during
 
-            # 3) Фаза «нет события»: накопление до первой серии из PPD_MIN_EVENT_DAYS dev-дней
+            # ---------------- Фаза «вне события» ------------------------------
             if not in_event:
-                if rel < PPD_REL_THRESH:
-                    # Здоровый день до старта
+                if rel < PPD_REL_THRESH:          # healthy-день
                     devs.clear()
                     window.append((today, q))
                     if len(window) > PPD_WINDOW_SIZE:
                         window.pop(0)
-                else:
-                    # Dev-день до старта: фильтрация внутри devs
-                    devs.append((today, q))
-                    while devs:
-                        mean_devs = compute_baseline([v for (_, v) in devs])
-                        if mean_devs == 0.0:
-                            rel_dev = 0.0 if q == 0.0 else float('inf')
-                        else:
-                            rel_dev = abs(q - mean_devs) / mean_devs
-
-                        if rel_dev < PPD_REL_THRESH:
-                            break
-                        devs.pop(0)
-
-                    if len(devs) < PPD_MIN_EVENT_DAYS:
-                        continue  # ждём накопления PPD_MIN_EVENT_DAYS подряд dev-точек
-
-                    # --- Старт первого события ---
-                    start_date = devs[0][0]
-                    baseline_before = baseline_during
-
-                    # Инициализируем global min/max по первым PPD_MIN_EVENT_DAYS dev-точкам
-                    values_initial_dev = [v for (_, v) in devs]
-                    event_min = min(values_initial_dev)
-                    event_max = max(values_initial_dev)
-
-                    # Очищаем window и переносим туда эти PPD_MIN_EVENT_DAYS точек
-                    window.clear()
-                    window.extend(devs)
-
-                    in_event = True
-                    devs.clear()
-                    # После старта события, переходим к обработке как «in_event»
-
-            # 4) Фаза «внутри события»
-            if in_event:
-                #   a) Пересчитываем baseline_during = среднее window
-                baseline_during = compute_baseline([v for (_, v) in window])
-
-                #   b) Определяем, healthy или dev внутри события
-                if rel < PPD_REL_THRESH:
-                    # Здоровый день внутри события
-                    devs.clear()
-                    window.append((today, q))
-                    if len(window) > PPD_WINDOW_SIZE:
-                        window.pop(0)
-                    # Обновляем global min/max всего события
-                    event_min = q if event_min is None else min(event_min, q)
-                    event_max = q if event_max is None else max(event_max, q)
                     continue
 
-                # Dev-день внутри события: добавляем + фильтрация
+                # dev-день до старта: фильтрация внутри devs
                 devs.append((today, q))
                 while devs:
-                    mean_devs = compute_baseline([v for (_, v) in devs])
-                    if mean_devs == 0.0:
-                        rel_dev = 0.0 if q == 0.0 else float('inf')
-                    else:
-                        rel_dev = abs(q - mean_devs) / mean_devs
-
+                    mean_devs = _mean([v for (_, v) in devs])
+                    rel_dev = (abs(q - mean_devs) / mean_devs) if mean_devs else 0.0
                     if rel_dev < PPD_REL_THRESH:
                         break
                     devs.pop(0)
 
-                # Каждая dev-точка тоже обновляет global min/max
-                event_min = q if event_min is None else min(event_min, q)
-                event_max = q if event_max is None else max(event_max, q)
+                if len(devs) < PPD_MIN_EVENT_DAYS:
+                    continue  # ждем накопления серии dev-дней
+
+                # ---- старт события ------------------------------------------
+                start_date = devs[0][0]
+                baseline_before = baseline_during
+
+                # инициализация экстремумов по первым dev-точкам
+                values_init = [v for (_, v) in devs]
+                event_min = min(values_init)
+                event_max = max(values_init)
+
+                window.clear()
+                window.extend(devs)
+                in_event = True
+                devs.clear()
+                # далее переходим к блоку «in_event»
+
+            # ---------------- Фаза «внутри события» ---------------------------
+            if in_event:
+                baseline_during = _mean([v for (_, v) in window])
+
+                if rel < PPD_REL_THRESH:          # healthy-день внутри события
+                    devs.clear()
+                    window.append((today, q))
+                    if len(window) > PPD_WINDOW_SIZE:
+                        window.pop(0)
+                    event_min = min(event_min, q) if event_min is not None else q
+                    event_max = max(event_max, q) if event_max is not None else q
+                    continue
+
+                # dev-день внутри события
+                devs.append((today, q))
+                while devs:
+                    mean_devs = _mean([v for (_, v) in devs])
+                    rel_dev = (abs(q - mean_devs) / mean_devs) if mean_devs else 0.0
+                    if rel_dev < PPD_REL_THRESH:
+                        break
+                    devs.pop(0)
+
+                event_min = min(event_min, q) if event_min is not None else q
+                event_max = max(event_max, q) if event_max is not None else q
 
                 if len(devs) < PPD_MIN_EVENT_DAYS:
                     continue
 
-                # --- Закрываем текущее событие (вторая подрядная серия из PPD_MIN_EVENT_DAYS dev-дней) ---
+                # ---- закрываем событие --------------------------------------
                 end_date = devs[0][0] - timedelta(days=1)
                 duration = (end_date - start_date).days + 1
 
@@ -159,26 +173,23 @@ def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
                 max_q = int(round(max(win_vals)))
 
                 all_events.append({
-                    'well': well,
-                    'start_date': start_date.strftime('%d-%m-%Y'),
-                    'end_date': end_date.strftime('%d-%m-%Y'),
-                    # Приводим baseline_before и baseline_during к целым
-                    'baseline_before': int(round(baseline_before)),
-                    'baseline_during': int(round(baseline_during)),
-                    'min_q': min_q,
-                    'max_q': max_q,
-                    'duration_days': duration
+                    "well": well,
+                    "start_date": start_date.strftime("%d-%m-%Y"),
+                    "end_date": end_date.strftime("%d-%m-%Y"),
+                    "baseline_before": int(round(baseline_before)),
+                    "baseline_during": int(round(baseline_during)),
+                    "min_q": min_q,
+                    "max_q": max_q,
+                    "duration_days": duration,
                 })
 
-                # --- Запускаем новое событие из этих PPD_MIN_EVENT_DAYS dev-точек ---
+                # --- новая инициализация для возможного следующего события ---
                 window.clear()
                 window.extend(devs)
-
                 start_date = devs[0][0]
                 baseline_before = baseline_during
-                baseline_during = compute_baseline([v for (_, v) in devs])
+                baseline_during = _mean([v for (_, v) in devs])
 
-                # Инициализируем global min/max для нового события
                 values_new_dev = [v for (_, v) in devs]
                 event_min = min(values_new_dev)
                 event_max = max(values_new_dev)
@@ -186,69 +197,60 @@ def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
                 devs.clear()
                 in_event = True  # остаёмся «внутри» нового события
 
-        # 5) В конце, если всё ещё in_event, фиксируем незакрытое событие
+        # --- 2. Конец ряда: фиксируем незакрытое событие ----------------------
         if in_event and window:
             end_date = window[-1][0]
             duration = (end_date - start_date).days + 1
-
             win_vals = [v for (_, v) in window]
             min_q = int(round(min(win_vals)))
             max_q = int(round(max(win_vals)))
 
             all_events.append({
-                'well': well,
-                'start_date': start_date.strftime('%d-%m-%Y'),
-                'end_date': end_date.strftime('%d-%m-%Y'),
-                'baseline_before': int(round(baseline_before)),
-                'baseline_during': int(round(baseline_during)),
-                'min_q': min_q,
-                'max_q': max_q,
-                'duration_days': duration
+                "well": well,
+                "start_date": start_date.strftime("%d-%m-%Y"),
+                "end_date": end_date.strftime("%d-%m-%Y"),
+                "baseline_before": int(round(baseline_before)),
+                "baseline_during": int(round(baseline_during)),
+                "min_q": min_q,
+                "max_q": max_q,
+                "duration_days": duration,
             })
 
-    # Собираем результаты в DataFrame
+    # --- 3. Собираем финальный DataFrame -------------------------------------
     events_df = pd.DataFrame(all_events, columns=[
-        'well', 'start_date', 'end_date',
-        'baseline_before', 'baseline_during',
-        'min_q', 'max_q', 'duration_days'
+        "well", "start_date", "end_date",
+        "baseline_before", "baseline_during",
+        "min_q", "max_q", "duration_days",
     ])
-    for col in ['baseline_before', 'baseline_during', 'min_q', 'max_q']:
-        # 1) Достаём все значения, превращаем каждый в Python int
-        py_list = [int(x) for x in events_df[col].tolist()]
-        # 2) Присваиваем обратно и сразу меняем тип столбца на object
-        events_df[col] = pd.Series(py_list, dtype=object)
+
+    # столбцы-инт вершём в object, чтобы сохранить «точно int» без float-хвостов
+    for col in ("baseline_before", "baseline_during", "min_q", "max_q"):
+        events_df[col] = events_df[col].astype(object)
+
     return events_df
 
 
-
-
+# ---------------------------------------------------------------------------
+# CLI-режим: запуск «как скрипт»
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # -----------------------------------------------
-    # Когда модуль запускается напрямую, он автоматически:
-    # 1) читает «clean_data/ppd_clean.csv»
-    # 2) запускает detect_ppd_events()
-    # 3) сохраняет результат в «ppd_events.csv»
-    # -----------------------------------------------
-
-    # Предполагаем, что файл лежит по пути «clean_data/ppd_clean.csv»
+    # 1) входной CSV с суточными PPD-рядами
     input_path = os.path.join("clean_data", "ppd_clean.csv")
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Не найден файл: {input_path}")
 
-    # Читаем входные данные
     ppd_df = pd.read_csv(input_path)
-    # Если столбец date не в datetime, приводим:
+    # приведение date → datetime при необходимости
     if not np.issubdtype(ppd_df["date"].dtype, np.datetime64):
-        # Попробуем догадаться: чаще всего в формате «DD.MM.YYYY»
         try:
             ppd_df["date"] = pd.to_datetime(ppd_df["date"], dayfirst=True)
         except Exception:
             ppd_df["date"] = pd.to_datetime(ppd_df["date"])
 
-    # Запускаем обнаружение событий
+    # 2) детекция событий
     events_df = detect_ppd_events(ppd_df)
 
-    # Сохраняем результат в «ppd_events.csv» рядом с этим скриптом
-    output_path = "clean_data/ppd_events.csv"
-    events_df.to_csv(output_path, index=False)
-    print(f"Обнаружено событий: {len(events_df)}. Сохранено в файл: {output_path}")
+    # 3) вывод
+    output_path = os.path.join("clean_data", "ppd_events.csv")
+    events_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"Обнаружено событий: {len(events_df)}  →  {output_path}")
