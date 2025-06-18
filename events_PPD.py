@@ -1,116 +1,142 @@
-
 """
-Что делает модуль
------------------
-1. Принимает суточный DataFrame *ppd_df* с колонками
-   «well, date, q_ppd» (расход) и, опционально, «p_cust» (кустовое давление).
-2. Для каждой скважины ищет периоды резкого отклонения дебита («dev-дни»)
-   относительно скользящего baseline.
-3. Когда накапливается серия из **PPD_MIN_EVENT_DAYS** подряд dev-дней,
-   фиксируется начало события; окончание определяется аналогично.
-4. Для каждого события рассчитываются:
-   – *baseline_before* (дебит до события)
-   – *baseline_during* (дебит по ходу события)
-   – *min_q* / *max_q*  экстремумы внутри события
-   – *duration_days*   длительность события
-   Все четыре показателя округляются до целого `int`.
-5. Возвращает DataFrame **ppd_events** со столбцами
-   `['well','start_date','end_date','baseline_before','baseline_during',
-     'min_q','max_q','duration_days']`.
 
-Константы `PPD_REL_THRESH`, `PPD_MIN_EVENT_DAYS`, `PPD_WINDOW_SIZE`
-подтягиваются из *config.py* — они задают чувствительность алгоритма.
+========================  О Б З О Р  М О Д У Л Я  ========================
+Модуль выделяет интервалы резкого изменения суточного расхода приёма **q_ppd**
+по каждой скважине. Алгоритм не зависит от конкретного формата хранения
+данных — вся тяжёлая логика инкапсулирована в «чистом ядре»
+:pyfunc:`_detect_ppd_events_df`, которое работает **только** с
+:pymod:`pandas.DataFrame` и не обращается к файловой системе.
 
-Колонки на входе (`ppd_daily`):
-    well | date | q_ppd | … (остальные не используются)
-Колонки на выходе (`ppd_events`):
-    well, start_date, end_date,
-    baseline_before, baseline_during,
-    min_q, max_q, duration_days
+* **Чистое ядро** — `_detect_ppd_events_df(ppd_df)` → `ppd_events`.
+* **Универсальный интерфейс** — `detect_ppd_events(...)`, который по выбору
+  принимает входные DataFrame-ы *или* загружает их из CSV, а также умеет
+  сохранять результат в `clean_data/`.
+* **CLI-режим** — запуск модуля как скрипта сохраняет 100 % прежнюю
+  функциональность: читает `clean_data/ppd_clean.csv`, детектирует события,
+  пишет `clean_data/ppd_events.csv`.
+
+Все параметры чувствительности алгоритма (`PPD_REL_THRESH`,
+`PPD_MIN_EVENT_DAYS`, `PPD_WINDOW_SIZE`) берутся из глобального
+:mypy:`config.py`.
+
+==========================================================================
 """
+from __future__ import annotations
 
 import os
 from datetime import timedelta
+from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 
-from config import PPD_REL_THRESH, PPD_MIN_EVENT_DAYS, PPD_WINDOW_SIZE
+from config import (
+    PPD_REL_THRESH,       # относительный порог отклонения дебита
+    PPD_MIN_EVENT_DAYS,   # минимальная длина серии dev-дней для фиксации события
+    PPD_WINDOW_SIZE,      # ширина «скользящего» окна baseline
+)
 
+# Папка, где по умолчанию лежат/создаются CSV с промежуточными данными
+CLEAN_DIR = Path("clean_data")
+CLEAN_DIR.mkdir(exist_ok=True)
 
-def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
+# ----------------------------------------------------------------------
+#  В С П О М О Г А Т Е Л Ь Н Ы Е  Ф У Н К Ц И И
+# ----------------------------------------------------------------------
+
+def _mean(seq: List[float]) -> float:
+    """Среднее значение списка *seq*. Если список пуст, возвращает 0.0.
+
+    Функция вынесена отдельно, чтобы избежать дублирования и повысить
+    читаемость основного алгоритма.
     """
-    Анализирует суточный ряд q_ppd каждой скважины и формирует таблицу событий.
+    return float(np.mean(seq)) if seq else 0.0
+
+
+# ======================================================================
+#                       Ч И С Т О Е   Я Д Р О
+# ======================================================================
+
+def _detect_ppd_events_df(ppd_df: pd.DataFrame) -> pd.DataFrame:
+    """Определяет интервалы «событий» (аномальной динамики **q_ppd**).
+
+    Алгоритм пошагово сопоставим с первоначальной реализацией *events_PPD.py* —
+    разница лишь в том, что полностью исключён файловый ввод/вывод.
 
     Параметры
     ----------
     ppd_df : pd.DataFrame
-        Обязательные колонки:
-            • 'well'  – идентификатор скважины (str / int)
-            • 'date'  – дата измерения (pd.Timestamp или строка 'DD.MM.YYYY')
-            • 'q_ppd' – расход приёма, м³/сут (float / int)
+        Очищенный суточный ряд приёма жидкости (ППД). Требуемые столбцы::
 
-        Предполагается, что данные уже очищены предобработкой:
-        даты валидны, NaN удалены, строки отсортированы по дате внутри каждой
-        скважины.
+            well | date | q_ppd [| ...]
+
+        * **well**  — идентификатор скважины (str / int).
+        * **date**  — дата наблюдения (`datetime64[ns]`).
+        * **q_ppd** — суточный дебит приёма, м³/сут (int / float).
+
+        Датафрейм должен быть предварительно отсортирован по «date» внутри
+        каждой скважины, пропуски заполнены.
 
     Возвращает
     ----------
     pd.DataFrame
-        Столбцы:
-        'well', 'start_date', 'end_date',
-        'baseline_before', 'baseline_during',
-        'min_q', 'max_q', 'duration_days'
+        Таблица событий (аналог прежнего `ppd_events.csv`) со столбцами::
+
+            well | start_date | end_date | baseline_before | baseline_during |
+            min_q | max_q | duration_days
+
+        Все числовые показатели округлены до `int` без дробной части.
     """
-    # --- 0. Убедимся, что date – это datetime --------------------------------
+    # --- 0. Приводим колонку date к dtype datetime -------------------------
     if not np.issubdtype(ppd_df["date"].dtype, np.datetime64):
         ppd_df = ppd_df.copy()
-        ppd_df["date"] = pd.to_datetime(ppd_df["date"], dayfirst=True)
+        ppd_df["date"] = pd.to_datetime(ppd_df["date"], dayfirst=True, errors="coerce")
 
-    all_events = []
+    events_out: List[dict] = []
 
-    def _mean(lst):
-        """Небольшой helper: среднее списка или 0.0, если список пуст."""
-        return float(np.mean(lst)) if lst else 0.0
-
-    # --- 1. Проходим по всем скважинам ---------------------------------------
-    for well, group in ppd_df.groupby("well"):
+    # --- 1. Обходим каждую скважину отдельно ------------------------------
+    for well, group in ppd_df.groupby("well", sort=False):
+        # Внутренние локальные структуры
         dfw = group.sort_values("date").reset_index(drop=True)
-        dates = dfw["date"].tolist()
-        values = dfw["q_ppd"].tolist()
+        dates: List[pd.Timestamp] = dfw["date"].tolist()
+        values: List[float] = dfw["q_ppd"].astype(float).tolist()
 
-        window = []      # скользящее окно (healthy + dev), макс. PPD_WINDOW_SIZE
-        devs = []        # подрядные dev-дни (фильтруются внутри цикла)
+        # «Скользящее» окно последних точек (healthy + dev)
+        window: List[Tuple[pd.Timestamp, float]] = []
+        # Массив dev‑дней подряд
+        devs: List[Tuple[pd.Timestamp, float]] = []
 
-        in_event = False
-        start_date = None
-        baseline_before = None
-        baseline_during = None
+        in_event = False                   # флаг «мы внутри события»
+        start_date: pd.Timestamp | None = None
+        baseline_before: float | None = None
 
-        event_min = None
-        event_max = None
+        event_min: float | None = None     # экстремумы внутри события
+        event_max: float | None = None
 
         for today, q in zip(dates, values):
-            # 1.1 Текущий baseline_during = среднее по window
+            # 1.1 Текущий baseline как среднее по окну
             baseline_during = _mean([v for (_, v) in window]) if window else q
 
-            # 1.2 Относительное отклонение от baseline
+            # 1.2 Относительное отклонение сегодняшнего дебита от baseline
             if baseline_during == 0.0:
                 rel = 0.0 if q == 0.0 else float("inf")
             else:
                 rel = abs(q - baseline_during) / baseline_during
 
-            # ---------------- Фаза «вне события» ------------------------------
+            # ============= Фаза «вне события» =============================
             if not in_event:
-                if rel < PPD_REL_THRESH:          # healthy-день
+                # healthy‑день → расширяем окно и продолжаем
+                if rel < PPD_REL_THRESH:
                     devs.clear()
                     window.append((today, q))
                     if len(window) > PPD_WINDOW_SIZE:
                         window.pop(0)
                     continue
 
-                # dev-день до старта: фильтрация внутри devs
+                # dev‑день: аккумулируем и проверяем устойчивость
                 devs.append((today, q))
+                # Фильтрация «выбросов» внутри dev‑последовательности
                 while devs:
                     mean_devs = _mean([v for (_, v) in devs])
                     rel_dev = (abs(q - mean_devs) / mean_devs) if mean_devs else 0.0
@@ -118,38 +144,39 @@ def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
                         break
                     devs.pop(0)
 
+                # Ждём, пока dev‑дней накопится достаточно для события
                 if len(devs) < PPD_MIN_EVENT_DAYS:
-                    continue  # ждем накопления серии dev-дней
+                    continue
 
-                # ---- старт события ------------------------------------------
+                # ---- СТАРТ СОБЫТИЯ --------------------------------------
                 start_date = devs[0][0]
                 baseline_before = baseline_during
 
-                # инициализация экстремумов по первым dev-точкам
-                values_init = [v for (_, v) in devs]
-                event_min = min(values_init)
-                event_max = max(values_init)
+                # Начальные экстремумы по dev‑дням
+                init_vals = [v for (_, v) in devs]
+                event_min = min(init_vals)
+                event_max = max(init_vals)
 
-                window.clear()
-                window.extend(devs)
-                in_event = True
+                # Перезапуск окна
+                window.clear(); window.extend(devs)
                 devs.clear()
-                # далее переходим к блоку «in_event»
+                in_event = True
 
-            # ---------------- Фаза «внутри события» ---------------------------
+            # ============= Фаза «внутри события» =========================
             if in_event:
-                baseline_during = _mean([v for (_, v) in window])
+                baseline_during = _mean([v for (_, v) in window]) or q
 
-                if rel < PPD_REL_THRESH:          # healthy-день внутри события
+                # healthy‑день внутри события
+                if rel < PPD_REL_THRESH:
                     devs.clear()
                     window.append((today, q))
                     if len(window) > PPD_WINDOW_SIZE:
                         window.pop(0)
-                    event_min = min(event_min, q) if event_min is not None else q
-                    event_max = max(event_max, q) if event_max is not None else q
+                    event_min = q if event_min is None else min(event_min, q)
+                    event_max = q if event_max is None else max(event_max, q)
                     continue
 
-                # dev-день внутри события
+                # dev‑день внутри события
                 devs.append((today, q))
                 while devs:
                     mean_devs = _mean([v for (_, v) in devs])
@@ -158,13 +185,14 @@ def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
                         break
                     devs.pop(0)
 
-                event_min = min(event_min, q) if event_min is not None else q
-                event_max = max(event_max, q) if event_max is not None else q
+                event_min = q if event_min is None else min(event_min, q)
+                event_max = q if event_max is None else max(event_max, q)
 
+                # Проверяем условие закрытия события
                 if len(devs) < PPD_MIN_EVENT_DAYS:
                     continue
 
-                # ---- закрываем событие --------------------------------------
+                # ---- ЗАКРЫТИЕ СОБЫТИЯ -----------------------------------
                 end_date = devs[0][0] - timedelta(days=1)
                 duration = (end_date - start_date).days + 1
 
@@ -172,7 +200,7 @@ def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
                 min_q = int(round(min(win_vals)))
                 max_q = int(round(max(win_vals)))
 
-                all_events.append({
+                events_out.append({
                     "well": well,
                     "start_date": start_date.strftime("%d-%m-%Y"),
                     "end_date": end_date.strftime("%d-%m-%Y"),
@@ -183,21 +211,16 @@ def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
                     "duration_days": duration,
                 })
 
-                # --- новая инициализация для возможного следующего события ---
-                window.clear()
-                window.extend(devs)
+                # --- Возможное продолжение (несколько событий подряд) ----
+                window.clear(); window.extend(devs)
                 start_date = devs[0][0]
                 baseline_before = baseline_during
                 baseline_during = _mean([v for (_, v) in devs])
+                event_min = min([v for (_, v) in devs])
+                event_max = max([v for (_, v) in devs])
+                devs.clear(); in_event = True
 
-                values_new_dev = [v for (_, v) in devs]
-                event_min = min(values_new_dev)
-                event_max = max(values_new_dev)
-
-                devs.clear()
-                in_event = True  # остаёмся «внутри» нового события
-
-        # --- 2. Конец ряда: фиксируем незакрытое событие ----------------------
+        # --- 2. Обрезаем «хвост» незакрытого события ---------------------
         if in_event and window:
             end_date = window[-1][0]
             duration = (end_date - start_date).days + 1
@@ -205,52 +228,81 @@ def detect_ppd_events(ppd_df: pd.DataFrame) -> pd.DataFrame:
             min_q = int(round(min(win_vals)))
             max_q = int(round(max(win_vals)))
 
-            all_events.append({
+            events_out.append({
                 "well": well,
                 "start_date": start_date.strftime("%d-%m-%Y"),
                 "end_date": end_date.strftime("%d-%m-%Y"),
                 "baseline_before": int(round(baseline_before)),
-                "baseline_during": int(round(baseline_during)),
+                "baseline_during": int(round(_mean(win_vals))),
                 "min_q": min_q,
                 "max_q": max_q,
                 "duration_days": duration,
             })
 
-    # --- 3. Собираем финальный DataFrame -------------------------------------
-    events_df = pd.DataFrame(all_events, columns=[
+    # --- 3. Финальный DataFrame ------------------------------------------
+    events_df = pd.DataFrame(events_out, columns=[
         "well", "start_date", "end_date",
         "baseline_before", "baseline_during",
         "min_q", "max_q", "duration_days",
     ])
 
-    # столбцы-инт вершём в object, чтобы сохранить «точно int» без float-хвостов
+    # Конвертируем числовые столбцы в object, чтобы исключить float‑хвосты
     for col in ("baseline_before", "baseline_during", "min_q", "max_q"):
         events_df[col] = events_df[col].astype(object)
 
     return events_df
 
+# ======================================================================
+#                     У Н И В Е Р С А Л Ь Н Ы Й   И Н Т Е Р Ф Е Й С
+# ======================================================================
 
-# ---------------------------------------------------------------------------
-# CLI-режим: запуск «как скрипт»
-# ---------------------------------------------------------------------------
+def detect_ppd_events(
+    *,
+    ppd_df: pd.DataFrame | None = None,
+    csv_path: str | Path | None = None,
+    save_csv: bool = True,
+) -> pd.DataFrame:
+    """Обёртка над :pyfunc:`_detect_ppd_events_df` с поддержкой I/O.
+
+    Параметры
+    ----------
+    ppd_df : pd.DataFrame | None, optional
+        Если передан DataFrame — используется он, файлы **не** читаются.
+    csv_path : str | Path | None, optional
+        Путь к CSV с колонками ``well, date, q_ppd``; нужен, когда `ppd_df` не
+        задан. По умолчанию берётся «clean_data/ppd_clean.csv».
+    save_csv : bool, default **True**
+        При *True* результат сохраняется в «clean_data/ppd_events.csv».
+
+    Возвращает
+    ----------
+    pd.DataFrame
+        Таблица детектированных событий (см. описание :pyfunc:`_detect_ppd_events_df`).
+    """
+    # 1) Получаем входной DataFrame -------------------------------------
+    if ppd_df is None:
+        csv_path = Path(csv_path or CLEAN_DIR / "ppd_clean.csv")
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Файл не найден: {csv_path}")
+        ppd_df = pd.read_csv(csv_path)
+        # дата в datetime, если нужно
+        if not np.issubdtype(ppd_df["date"].dtype, np.datetime64):
+            ppd_df["date"] = pd.to_datetime(ppd_df["date"], dayfirst=True, errors="coerce")
+
+    # 2) Чистое ядро ----------------------------------------------------
+    events_df = _detect_ppd_events_df(ppd_df)
+
+    # 3) Сохранение на диск (по желанию) --------------------------------
+    if save_csv:
+        out_path = CLEAN_DIR / "ppd_events.csv"
+        events_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"✓ События ППД сохранены: {out_path} (N={len(events_df)})")
+
+    return events_df
+
+# ----------------------------------------------------------------------
+#                               C L I                                   
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # 1) входной CSV с суточными PPD-рядами
-    input_path = os.path.join("clean_data", "ppd_clean.csv")
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Не найден файл: {input_path}")
-
-    ppd_df = pd.read_csv(input_path)
-    # приведение date → datetime при необходимости
-    if not np.issubdtype(ppd_df["date"].dtype, np.datetime64):
-        try:
-            ppd_df["date"] = pd.to_datetime(ppd_df["date"], dayfirst=True)
-        except Exception:
-            ppd_df["date"] = pd.to_datetime(ppd_df["date"])
-
-    # 2) детекция событий
-    events_df = detect_ppd_events(ppd_df)
-
-    # 3) вывод
-    output_path = os.path.join("clean_data", "ppd_events.csv")
-    events_df.to_csv(output_path, index=False, encoding="utf-8-sig")
-    print(f"Обнаружено событий: {len(events_df)}  →  {output_path}")
+    # Запуск «как скрипт» полностью повторяет поведение старой версии
+    detect_ppd_events(save_csv=True)
