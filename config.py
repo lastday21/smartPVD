@@ -30,11 +30,10 @@ lambda_dist   = 900       # м – расстояние, на котором в�
 distance_mode = "linear"       # "exp"  (e^{-d/λ})  или  "linear"  (max(0,1-d/λ))
 
 #Метрики для расчета корреляции
-CORR_THRESHOLDS: tuple[float, float, float] = (0.05, 0.30, 0.60)    # Пороги корреляции (|ρ|)  none/weak, weak/medium, medium/strong
+CORR_THRESHOLDS: tuple[float, float] = (0.05, 0.30)    # Пороги корреляции (|ρ|)  none/weak, weak/impact
 MAX_LAG = 30    #CCF дней
 PENALTY_NEG      = 1      # отрицательный знак ρ
 PENALTY_ONE_EVT  = 2      # n_events == 1
-PENALTY_TWO_EVT  = 1      # n_events == 2
 MIN_POINTS_CCF = 60       # Минимум точек для надёжного ρ CCF
 
 # Метрики для расчета CI
@@ -46,7 +45,7 @@ divider_p: float = 1.5 # Делители для расчета CI Δp
 w_q: float = 0.6 # Веса для расчёта CI (сумма w_q + w_p должна быть = 1.0)
 w_p: float = 0.4 # Веса для расчёта CI (сумма w_q + w_p должна быть = 1.0)
 
-CI_THRESHOLDS = (0.5, 3, 8)  # none <0.5, weak <3, medium <8, strong ≥8
+CI_THRESHOLDS = (0.5, 3)  # none <0.5, weak <3, impact ≥3
 
 #Для финального рассчета
 FUSION_DIST_LIMIT = 900

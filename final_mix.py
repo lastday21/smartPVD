@@ -20,7 +20,7 @@ import pandas as pd
 from config import FUSION_DIST_LIMIT
 
 # Уровни категорий для сравнения
-LEVELS = {"none": 0, "weak": 1, "medium": 2, "strong": 3}
+LEVELS = {"none": 0, "weak": 1, "impact": 2}
 INV_LEVELS = {v: k for k, v in LEVELS.items()}
 
 
@@ -89,7 +89,7 @@ def run_final_mix(
         if (
             chosen == ci_cat
             and dist > dist_limit
-            and LEVELS[ci_cat] >= LEVELS["medium"]
+            and LEVELS[ci_cat] >= LEVELS["impact"]
             and LEVELS[corr_cat] <= LEVELS["weak"]
         ):
             chosen = INV_LEVELS[LEVELS[ci_cat] - 1]

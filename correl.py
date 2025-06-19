@@ -27,7 +27,6 @@ from config import (
     MAX_LAG,          # ± days for CCF
     PENALTY_NEG,      # penalty for negative ρ
     PENALTY_ONE_EVT,  # penalty for exactly 1 event
-    PENALTY_TWO_EVT,  # penalty for exactly 2 events
     MIN_POINTS_CCF,   # minimum points for CCF
 )
 
@@ -36,7 +35,7 @@ BASE_DIR: Path = Path("clean_data")
 OUT_CSV: Path = BASE_DIR / "corr_results.csv"
 GROUND_TRUTH: Path = Path("start_data") / "ground_truth.csv"
 
-LEVELS: Tuple[str, ...] = ("none", "weak", "medium", "strong")
+LEVELS: Tuple[str, ...] = ("none", "weak", "impact")
 L2I: Dict[str, int] = {lvl: i for i, lvl in enumerate(LEVELS)}
 
 # Подавляем ворнинги pandas о парсинге дат (специфично для ДД.ММ.ГГГГ)
@@ -49,15 +48,13 @@ warnings.filterwarnings(
 #                              ВСПОМОГАТЕЛЬНОЕ
 # ───────────────────────────────────────────────────────────────────────
 def _cat_by_abs(r: float) -> str:
-    """Возвращает категорию ('none'…'strong') по абсолютному значению |ρ|."""
-    t1, t2, t3 = CORR_THRESHOLDS
+    """Возвращает категорию ('none'…'impact') по абсолютному значению |ρ|."""
+    t1, t2 = CORR_THRESHOLDS
     if r < t1:
         return "none"
     if r < t2:
         return "weak"
-    if r < t3:
-        return "medium"
-    return "strong"
+    return "impact"
 
 
 def _best_ccf(inj: pd.Series, liq: pd.Series) -> float:
@@ -239,8 +236,6 @@ def _calc_corr_df(
             lvl -= PENALTY_NEG
         if r["n_events"] == 1:
             lvl -= PENALTY_ONE_EVT
-        elif r["n_events"] == 2:
-            lvl -= PENALTY_TWO_EVT
         return LEVELS[max(0, lvl)]
 
     feat["corr_cat"] = feat.apply(_assign_cat, axis=1)

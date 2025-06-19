@@ -16,7 +16,6 @@ metrics.py — расчёт Confidence Index (CI) для SmartPVD-MVP в фор�
    (технический русский язык).
 5. **Стиль** — сохранён PEP 8 и названия переменных; алгоритм не упрощён.
 
-Автор рефакторинга: ChatGPT-o3, 2025-06-18.
 """
 from __future__ import annotations
 
@@ -48,7 +47,7 @@ def _ci_value(dp: float, dq: float, dp_oil: float) -> float:
         Прирост дебита жидкости ΔQ<sub>liq</sub> (фактический или
         скорректированный на бейслайн).
     dp_oil : float
-        Прирост пластового давления по добыче ΔP<sub>oil</sub>.
+        Прирост давления на приеме ΔP<sub>oil</sub>.
 
     Returns
     -------
@@ -257,10 +256,10 @@ def _compute_ci_df(  # pylint: disable=too-many-arguments,too-many-locals
     agg_df[["oil_well", "ppd_well"]] = agg_df[["oil_well", "ppd_well"]].astype(str)
 
     # 9. Категория CI ----------------------------------------------------- #
-    t1, t2, t3 = config.CI_THRESHOLDS
+    t1, t2 = config.CI_THRESHOLDS
     agg_df["ci_cat"] = agg_df["CI_value"].apply(
-        lambda v: ("none", "weak", "medium", "strong")[
-            0 if v < t1 else 1 if v < t2 else 2 if v < t3 else 3
+        lambda v: ("none", "weak", "impact")[
+            0 if v < t1 else 1 if v < t2 else 2
         ]
     )
 
