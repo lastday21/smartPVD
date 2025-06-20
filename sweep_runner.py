@@ -1,56 +1,51 @@
 """
-sweep_runner.py — перебор гиперпараметров SmartPVD
+sweep_runner.py  — модуль гиперпараметрического перебора SmartPVD
 Python ≥ 3.10
 
-Редактируйте ТОЛЬКО блок НАСТРОЙКИ — остальное не трогайте.
+Правьте только блок НАСТРОЙКИ в начале файла, остальной код оставляйте без изменений.
 """
 
 from __future__ import annotations
 
-# ── НАСТРОЙКИ ПРОГОНА ────────────────────────────────────────────────────
-QUICK_MODE   = True   # True  → quick-режим, False → полный
-JOBS         = 8      # число параллельных ПРОЦЕССОВ (os.cpu_count() для 100%)
-QUICK_EARLY  = 4       # сколько ранних конфигов, если QUICK_MODE = True
-QUICK_TRIALS = 50      # trials на одну раннюю конфу в quick
-FULL_TRIALS  = 500     # trials на одну раннюю конфу в full
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────── БЛОК НАСТРОЙКИ ────────────────────────────────────────────
+QUICK_MODE   = False    # True → quick (4 ранних × 70 trials), False → полный (96 × 500)
+JOBS         = 8        # число процессов Parallel (лучше os.cpu_count())
+QUICK_EARLY  = 4        # «ранних» конфигов в quick
+QUICK_TRIALS = 100       # trials в quick
+FULL_TRIALS  = 500      # trials в full
+SEED         = 42       # фиксированный seed для воспроизводимости TPE
+# ──────────────────────────────────────────────────────────────────────────
 
-import contextlib, hashlib, itertools, logging, os, time
+import os
+# Каждая копия процесса займёт ровно 1 ядро для BLAS
+os.environ["OMP_NUM_THREADS"]      = "1"
+os.environ["MKL_NUM_THREADS"]      = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+import logging
+import optuna
+from optuna.logging import set_verbosity, WARNING
+set_verbosity(WARNING)
+optuna.logging.disable_default_handler()
+_lg = logging.getLogger("optuna")
+_lg.setLevel(logging.WARNING)
+_lg.handlers.clear()
+_lg.propagate = False
+
+import contextlib
+import hashlib
+import itertools
+import time
+import threading
+from threading import Event
+from multiprocessing import Manager
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import joblib
 import pandas as pd
 
-# ── Optuna (тихий) ───────────────────────────────────────────────────────
-try:
-    import optuna
-
-    try:                       # >=3.5
-        from optuna.logging import set_verbosity, WARNING as OT_WARNING
-        set_verbosity(OT_WARNING)
-    except ImportError:
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-except ModuleNotFoundError:
-    # суррогат, чтобы файл импортировался без Optuna
-    import random, types
-
-    class _DTrial:             # noqa: D401
-        def __init__(self, n): self.number = n
-        def suggest_int(self, *_): return random.randint(2, 6)
-        def suggest_categorical(self, _, choices): return random.choice(choices)
-
-    class _DStudy:
-        def __init__(self): self.best_value = 0
-        def optimize(self, fn, n_trials, **_):
-            for i in range(n_trials): fn(_DTrial(i))
-
-    optuna = types.SimpleNamespace(
-        samplers=types.SimpleNamespace(TPESampler=lambda seed=None: None),
-        create_study=lambda direction, sampler: _DStudy(),
-    )
-
-# ── SmartPVD core ────────────────────────────────────────────────────────
+# ─── SmartPVD core ────────────────────────────────────────────────────────
 import sys
 ROOT = Path(__file__).resolve().parent
 sys.path.append(str(ROOT))
@@ -58,7 +53,7 @@ sys.path.append(str(ROOT))
 import config, preprocess, events_PPD, well_pairs, oil_windows  # noqa: E402
 import metrics, correl, final_mix                               # noqa: E402
 
-# ── Глобальные списки параметров ─────────────────────────────────────────
+# ─── Пары сеток ───────────────────────────────────────────────────────────
 EARLY_GRID = {
     "PPD_REL_THRESH":    [0.15, 0.20, 0.25, 0.30],
     "LAG_DAYS":          [0, 1],
@@ -75,47 +70,58 @@ mem_l1 = joblib.Memory(CACHE_DIR / "l1", verbose=0)
 mem_l2 = joblib.Memory(CACHE_DIR / "l2", verbose=0)
 mem_l3 = joblib.Memory(CACHE_DIR / "l3", verbose=0)
 
-# ── patch config + correl ────────────────────────────────────────────────
+# ─── patch config+correl ───────────────────────────────────────────────────
 @contextlib.contextmanager
 def patch_cfg(**kw):
     old_cfg  = {k: getattr(config, k) for k in kw}
     old_corr = {k: getattr(correl, k) for k in kw if hasattr(correl, k)}
     for k, v in kw.items():
         setattr(config, k, v)
-        if k in old_corr: setattr(correl, k, v)
-    try: yield
+        if k in old_corr:
+            setattr(correl, k, v)
+    try:
+        yield
     finally:
-        for k, v in old_cfg.items():  setattr(config, k, v)
-        for k, v in old_corr.items(): setattr(correl, k, v)
+        for k, v in old_cfg.items():
+            setattr(config, k, v)
+        for k, v in old_corr.items():
+            setattr(correl, k, v)
 
-# ── L1-L3 кеши ───────────────────────────────────────────────────────────
+# ─── L1–L3 кеши ───────────────────────────────────────────────────────────
 @mem_l1.cache
 def _clean():
     return preprocess.build_clean_data(save_csv=False)
 
 @mem_l2.cache
-def _ppd_events(rel):
-    ppd, _, _ = _clean()
+def _ppd_events(rel: float):
+    ppd_df, oil_df, coords_df = _clean()
     with patch_cfg(PPD_REL_THRESH=rel):
-        return events_PPD.detect_ppd_events(ppd_df=ppd, save_csv=False)
+        return events_PPD.detect_ppd_events(ppd_df=ppd_df, save_csv=False)
 
 @mem_l3.cache
-def _oil_windows(rel, lag, chk, dlt):
-    ppd, oil, crd = _clean()
+def _oil_windows(rel: float, lag: int, check: int, delta_p: float):
+    ppd_df, oil_df, coords_df = _clean()
     ppd_ev = _ppd_events(rel)
-    pairs  = well_pairs.build_pairs(coords_df=crd, oil_df=oil, ppd_df=ppd, save_csv=False)
-    with patch_cfg(LAG_DAYS=lag, OIL_CHECK_DAYS=chk, OIL_DELTA_P_THRESH=dlt):
-        wins = oil_windows.build_oil_windows(
-            ppd_events_df=ppd_ev, oil_df=oil, pairs_df=pairs, save_csv=False
+    pairs_df = well_pairs.build_pairs(
+        coords_df=coords_df, oil_df=oil_df, ppd_df=ppd_df, save_csv=False
+    )
+    with patch_cfg(LAG_DAYS=lag,
+                   OIL_CHECK_DAYS=check,
+                   OIL_DELTA_P_THRESH=delta_p):
+        oil_win = oil_windows.build_oil_windows(
+            ppd_events_df=ppd_ev,
+            oil_df=oil_df,
+            pairs_df=pairs_df,
+            save_csv=False
         )
-    return wins, ppd_ev, oil, pairs, ppd
+    return oil_win, ppd_ev, oil_df, pairs_df, ppd_df
 
-# ── GT-метрики ───────────────────────────────────────────────────────────
+# ─── GT-оценка ─────────────────────────────────────────────────────────────
 def evaluate(final_df: pd.DataFrame):
     gt = Path("start_data/ground_truth.csv")
-    if not gt.exists():              # нет эталона — все miss
-        tot = len(final_df)
-        return 0, 0, tot, 0.0
+    if not gt.exists():
+        total = len(final_df)
+        return 0, 0, total, 0.0
     gt_df = pd.read_csv(gt, dtype=str)
     if "oil_well" not in gt_df.columns and "well" in gt_df.columns:
         gt_df = gt_df.rename(columns={"well": "oil_well"})
@@ -126,96 +132,190 @@ def evaluate(final_df: pd.DataFrame):
     exact  = int((merged["final_cat"] == merged["expected"]).sum())
     nearby = int(merged.apply(
         lambda r: str(r["final_cat"]) in str(r["acceptable"]).split(";")
-        if pd.notna(r["acceptable"]) else False, axis=1
+                  if pd.notna(r["acceptable"]) else False, axis=1
     ).sum())
-    miss   = int(len(merged) - exact - nearby)
-    acc    = (exact + nearby) / len(merged) if len(merged) else 0.0
+    miss = len(merged) - exact - nearby
+    acc  = (exact + nearby) / len(merged) if len(merged) else 0.0
     return exact, nearby, miss, acc
 
-# ── objective фабрика ────────────────────────────────────────────────────
-def make_objective(early: Dict[str, Any]):
-    wins, ppd_ev, oil_df, pairs_df, ppd_df = _oil_windows(
-        early["PPD_REL_THRESH"], early["LAG_DAYS"],
-        early["OIL_CHECK_DAYS"], early["OIL_DELTA_P_THRESH"]
+# ─── Объект-фабрика с RAM-кешем L4/L5 и Pruner ────────────────────────────
+def make_objective(early: Dict[str, Any], counter, lock):
+    oil_win, ppd_ev, oil_df, pairs_df, ppd_df = _oil_windows(
+        early["PPD_REL_THRESH"],
+        early["LAG_DAYS"],
+        early["OIL_CHECK_DAYS"],
+        early["OIL_DELTA_P_THRESH"]
     )
 
-    def obj(trial):
-        divider_q = trial.suggest_int("divider_q", 2, 6)
-        divider_p = trial.suggest_int("divider_p", 2, 6)
-        w_q       = trial.suggest_categorical("w_q", [0.4, 0.5, 0.6])
-        w_p       = round(1 - w_q, 3)
+    ci_cache:   Dict[Tuple[Any, ...], pd.DataFrame] = {}
+    corr_cache: Dict[Tuple[Any, ...], pd.DataFrame] = {}
+    mix_cache:  Dict[Tuple[Any, ...], pd.DataFrame] = {}
+
+    def _objective(trial: optuna.trial.Trial):
+        dq = trial.suggest_int("divider_q", 2, 6)
+        dp = trial.suggest_int("divider_p", 2, 6)
+        wq = trial.suggest_categorical("w_q", [0.4, 0.5, 0.6])
+        wp = round(1 - wq, 3)
 
         ci_low, ci_high = map(float, trial.suggest_categorical(
-            "CI_THRESHOLDS", ["0.5,3", "1,3", "1.5,3.5", "2,4", "3,5"]).split(','))
-
+            "CI_THRESHOLDS", ["0.5,3","1,3","1.5,3.5","2,4","3,5"]
+        ).split(","))
         corr_low, corr_high = map(float, trial.suggest_categorical(
-            "CORR_THRESHOLDS", ["0.05,0.30", "0.10,0.30", "0.05,0.40", "0.10,0.40"]).split(','))
+            "CORR_THRESHOLDS", ["0.05,0.30","0.10,0.30","0.05,0.40","0.10,0.40"]
+        ).split(","))
+        mp = trial.suggest_categorical("MIN_POINTS_CCF", [30, 45, 60])
 
-        min_pts = trial.suggest_categorical("MIN_POINTS_CCF", [30, 45, 60])
+        late_cfg = dict(
+            divider_q=dq, divider_p=dp,
+            w_q=wq, w_p=wp,
+            CI_THRESHOLDS=(ci_low, ci_high),
+            CORR_THRESHOLDS=(corr_low, corr_high),
+            MIN_POINTS_CCF=mp
+        )
 
-        late = dict(divider_q=divider_q, divider_p=divider_p,
-                    w_q=w_q, w_p=w_p,
-                    CI_THRESHOLDS=(ci_low, ci_high),
-                    CORR_THRESHOLDS=(corr_low, corr_high),
-                    MIN_POINTS_CCF=min_pts)
+        # CI-кеш
+        key_ci = (dq, dp, wq, ci_low, ci_high)
+        if key_ci in ci_cache:
+            ci_df = ci_cache[key_ci]
+        else:
+            with patch_cfg(**late_cfg):
+                _, ci_df = metrics.compute_ci(
+                    (oil_win, ppd_ev, oil_df, pairs_df), save_csv=False
+                )
+            ci_cache[key_ci] = ci_df
 
-        with patch_cfg(**late):
-            _, ci_df = metrics.compute_ci((wins, ppd_ev, oil_df, pairs_df), save_csv=False)
-            corr_df  = correl.calc_corr((ppd_df, oil_df, ppd_ev, wins, pairs_df), save_csv=False)
+        # Corr-кеш
+        key_corr = (mp, corr_low, corr_high)
+        if key_corr in corr_cache:
+            corr_df = corr_cache[key_corr]
+        else:
+            with patch_cfg(**late_cfg):
+                corr_df = correl.calc_corr(
+                    (ppd_df, oil_df, ppd_ev, oil_win, pairs_df),
+                    save_csv=False
+                )
+            corr_cache[key_corr] = corr_df
 
-        best = float('inf')
+        best_loss = float("inf")
         rows = []
-        for dist in DIST_LIMITS:
-            with patch_cfg(FUSION_DIST_LIMIT=dist):
-                t0 = time.perf_counter()
-                final = final_mix.run_final_mix(corr_df, ci_df, pairs_df, dist_limit=dist)
-                rt  = int((time.perf_counter() - t0) * 1000)
+        for i_dist, dist in enumerate(DIST_LIMITS):
+            # final_mix-кеш
+            key_mix = key_ci + key_corr + (dist,)
+            if key_mix in mix_cache:
+                final = mix_cache[key_mix]
+            else:
+                with patch_cfg(FUSION_DIST_LIMIT=dist):
+                    final = final_mix.run_final_mix(
+                        corr_df=corr_df,
+                        ci_df=ci_df,
+                        pairs_df=pairs_df,
+                        dist_limit=dist
+                    )
+                mix_cache[key_mix] = final
 
             exact, nearby, miss, acc = evaluate(final)
+
             loss = -exact + 0.001 * miss
-            best = min(best, loss)
+            # отчёт и pruner
+            trial.report(loss, step=i_dist)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+            if loss < best_loss:
+                best_loss = loss
+
+            # атомарно считаем прогресс
+            with lock:
+                counter.value += 1
 
             rows.append(dict(
                 exact=exact, nearby=nearby, miss=miss, accuracy=round(acc,4),
-                ppd_rel=early["PPD_REL_THRESH"], lag=early["LAG_DAYS"],
-                check=early["OIL_CHECK_DAYS"], delta_p=early["OIL_DELTA_P_THRESH"],
-                div_q=divider_q, div_p=divider_p, w_q=w_q,
+                ppd_rel=early["PPD_REL_THRESH"],
+                lag=early["LAG_DAYS"],
+                check=early["OIL_CHECK_DAYS"],
+                delta_p=early["OIL_DELTA_P_THRESH"],
+                div_q=dq, div_p=dp, w_q=wq,
                 ci_low=ci_low, ci_high=ci_high,
                 corr_low=corr_low, corr_high=corr_high,
-                min_pts=min_pts, dist=dist,
-                early_hash=early["EARLY_HASH"], trial_id=trial.number,
-                runtime_ms=rt
+                min_pts=mp, dist=dist,
+                early_hash=early["EARLY_HASH"],
+                trial_id=trial.number
             ))
         trial.set_user_attr("rows", rows)
-        return best
-    return obj
+        return best_loss
 
-# ── одна ранняя конфигурация (работает в ПРОЦЕССЕ) ───────────────────────
-def run_one(idx: int, early_cfg: dict, trials: int):
-    early_cfg = early_cfg.copy()        # локальная копия
-    early_cfg["EARLY_HASH"] = hashlib.md5(
-        str(sorted(early_cfg.items())).encode()).hexdigest()[:8]
+    return _objective
 
-    logging.info("► proc %d | hash %s", idx, early_cfg["EARLY_HASH"])
+# ─── Работа по одному процессу ────────────────────────────────────────────
+def run_one(idx: int, ec: dict, trials: int, counter, lock):
+    import logging, optuna
+    from optuna.samplers import TPESampler
+    from optuna.pruners  import MedianPruner
+    from optuna.logging  import set_verbosity, WARNING
 
-    study = optuna.create_study(direction="minimize",
-                                sampler=optuna.samplers.TPESampler())  # без seed
-    study.optimize(make_objective(early_cfg), n_trials=trials, n_jobs=1, show_progress_bar=False)
+    set_verbosity(WARNING)
+    optuna.logging.disable_default_handler()
+    _lg = logging.getLogger("optuna")
+    _lg.setLevel(logging.WARNING)
+    _lg.handlers.clear()
+    _lg.propagate = False
 
-    # вытаскиваем все накопленные строки CSV из trials
-    all_rows = []
+    sampler = TPESampler(
+        n_startup_trials=10,
+        n_ei_candidates=128,
+        seed=None
+    )
+    pruner  = MedianPruner(
+        n_startup_trials=10,
+        n_warmup_steps=2
+    )
+
+    ec = ec.copy()
+    ec["EARLY_HASH"] = hashlib.md5(
+        str(sorted(ec.items())).encode()
+    ).hexdigest()[:8]
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner
+    )
+    study.optimize(
+        make_objective(ec, counter, lock),
+        n_trials=trials,
+        n_jobs=1,
+        show_progress_bar=False
+    )
+
+    all_rows: List[dict] = []
     for t in study.trials:
         all_rows.extend(t.user_attrs.get("rows", []))
     return all_rows
 
-# ── генерация ранних ─────────────────────────────────────────────────────
+# ─── Генерация «ранних» конфигов ─────────────────────────────────────────
 def gen_early(quick: bool):
-    keys  = list(EARLY_GRID)
-    combos = [dict(zip(keys, vals))
-              for vals in itertools.product(*(EARLY_GRID[k] for k in keys))]
+    keys   = list(EARLY_GRID)
+    combos = [dict(zip(keys, vals)) for vals in itertools.product(*(EARLY_GRID[k] for k in keys))]
     return combos[:QUICK_EARLY] if quick else combos
 
-# ── главный запуск ───────────────────────────────────────────────────────
+# ─── Монитор прогресса в потоке ──────────────────────────────────────────
+def monitor_thread(counter, total, done_evt: Event):
+    start = time.perf_counter()
+    logging.info("… %d/%d параметров выполнено, прошло %d с", 0, total, 0)
+    last = 0
+    while True:
+        time.sleep(30)
+        if done_evt.is_set():
+            break
+        done = counter.value
+        if done >= total:
+            break
+        if done != last:
+            elapsed = int(time.perf_counter() - start)
+            logging.info("… %d/%d параметров выполнено, прошло %d с", done, total, elapsed)
+            last = done
+
+# ─── Main ─────────────────────────────────────────────────────────────────
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -226,28 +326,50 @@ def main():
     quick  = QUICK_MODE
     trials = QUICK_TRIALS if quick else FULL_TRIALS
     early  = gen_early(quick)
+    total  = len(early) * trials * len(DIST_LIMITS)
 
-    total_params = len(early)*trials*len(DIST_LIMITS)
-    logging.info("Старт: quick=%s | процессов=%d | ранних=%d | trials=%d | params=%d",
-                 quick, JOBS, len(early), trials, total_params)
+    logging.info(
+        "Старт: quick=%s | процессов=%d | ранних=%d | trials=%d | params=%d",
+        quick, JOBS, len(early), trials, total
+    )
 
-    _clean()   # прогрев кеша
+    _clean()  # прогрев L1–L3 кешей
+
+    mgr     = Manager()
+    counter = mgr.Value('i', 0)
+    lock    = mgr.Lock()
+
+    done_evt = Event()
+    thr = threading.Thread(target=monitor_thread, args=(counter, total, done_evt), daemon=True)
+    thr.start()
 
     start = time.perf_counter()
     rows_nested = joblib.Parallel(n_jobs=JOBS, backend="loky")(
-        joblib.delayed(run_one)(i+1, ec, trials)
+        joblib.delayed(run_one)(i+1, ec, trials, counter, lock)
         for i, ec in enumerate(early)
     )
-    elapsed = int(time.perf_counter() - start)
-    logging.info("Все процессы завершили работу за %d с", elapsed)
+    done_evt.set()
+    thr.join()
 
-    # собираем и сохраняем CSV
-    flat_rows: List[dict] = [r for sub in rows_nested for r in sub]
-    df = (pd.DataFrame(flat_rows)
-            .sort_values(["exact","nearby","miss"], ascending=[False,False,True])
-            .reset_index(drop=True))
-    df.to_csv(CSV_PATH, index=False, encoding="utf-8-sig")
-    logging.info("✓ CSV сохранён → %s | rows=%d", CSV_PATH, len(df))
+    elapsed = time.perf_counter() - start
+    elapsed_int = int(elapsed)
+    done = counter.value
+
+    # логируем оба показателя: номинальные и реальные
+    speed_nominal = total / elapsed if elapsed > 0 else 0
+    speed_real    = done  / elapsed if elapsed > 0 else 0
+    logging.info("… %d/%d параметров выполнено, прошло %d с", done, total, elapsed_int)
+    logging.info(
+        "Скорость: nominal=%.2f п./с; real=%.2f п./с (отработано %d)",
+        speed_nominal, speed_real, done
+    )
+
+    flat = [r for sub in rows_nested for r in sub]
+    pd.DataFrame(flat).sort_values(
+        ["exact", "nearby", "miss"], ascending=[False, False, True]
+    ).to_csv(CSV_PATH, index=False, encoding="utf-8-sig")
+    logging.info("✓ CSV сохранён → %s | rows=%d", CSV_PATH, len(flat))
+
 
 if __name__ == "__main__":
     main()
