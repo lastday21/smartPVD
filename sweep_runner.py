@@ -10,9 +10,9 @@ from __future__ import annotations
 # ─────────────── БЛОК НАСТРОЙКИ ────────────────────────────────────────────
 QUICK_MODE   = False    # True → quick (4 ранних × 70 trials), False → полный (96 × 500)
 JOBS         = 8        # число процессов Parallel (лучше os.cpu_count())
-QUICK_EARLY  = 4        # «ранних» конфигов в quick
-QUICK_TRIALS = 100       # trials в quick
-FULL_TRIALS  = 500      # trials в full
+QUICK_EARLY  = 10        # «ранних» конфигов в quick
+QUICK_TRIALS = 300       # trials в quick
+FULL_TRIALS  = 1300      # trials в full
 SEED         = 42       # фиксированный seed для воспроизводимости TPE
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -172,7 +172,7 @@ def make_objective(early: Dict[str, Any], counter, lock):
             CORR_THRESHOLDS=(corr_low, corr_high),
             MIN_POINTS_CCF=mp
         )
-
+        gt_df = pd.read_csv('start_data/ground_truth.csv', dtype=str)
         # CI-кеш
         key_ci = (dq, dp, wq, ci_low, ci_high)
         if key_ci in ci_cache:
@@ -180,7 +180,7 @@ def make_objective(early: Dict[str, Any], counter, lock):
         else:
             with patch_cfg(**late_cfg):
                 _, ci_df = metrics.compute_ci(
-                    (oil_win, ppd_ev, oil_df, pairs_df), save_csv=False
+                    (oil_win, ppd_ev, oil_df, pairs_df, gt_df), save_csv=False, filter_by_gt=False
                 )
             ci_cache[key_ci] = ci_df
 
@@ -209,7 +209,7 @@ def make_objective(early: Dict[str, Any], counter, lock):
                         corr_df=corr_df,
                         ci_df=ci_df,
                         pairs_df=pairs_df,
-                        dist_limit=dist
+                        dist_limit=dist,
                     )
                 mix_cache[key_mix] = final
 
