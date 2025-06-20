@@ -62,11 +62,6 @@ def _merge_with_coords(coords: pd.DataFrame, wells: pd.Series, *, kind: str) -> 
     merged = subset.merge(coords[["well", "x", "y"]], on="well", how="inner")
 
     missing = set(wells) - set(merged["well"])
-    if missing:
-        print(
-            f"[well_pairs] ⚠ Внимание: следующие {kind}-скважины отсутствуют в "
-            f"coords_clean.csv и будут пропущены: {sorted(missing)}"
-        )
     return merged
 
 
