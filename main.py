@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 main.py — конвейер SmartPVD «от Excel до final_result.csv» через pandas.DataFrame.
 
 Режимы:
     DEBUG = True   — сохранять промежуточные CSV для отладки;
     DEBUG = False  — чистый in-memory (только финальный CSV).
+    final_filter_by_gt = True - включить проверку по GT(только для тестового варианта)
 
 Пайплайн:
     1) Предобработка исходных Excel/CSV → ppd_daily, oil_daily, coords_df
