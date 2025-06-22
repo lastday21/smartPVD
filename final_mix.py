@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 import pandas as pd
 
-from config import FUSION_DIST_LIMIT
+from config import FUSION_DIST_LIMIT, CORR_DIST_LIMIT
 
 # Уровни категорий для сравнения
 LEVELS = {"none": 0, "weak": 1, "impact": 2}
@@ -30,7 +30,7 @@ def run_final_mix(
     pairs_df: pd.DataFrame,
     allowed_pairs: set[tuple[str, str]] | None = None,
     dist_limit: int = FUSION_DIST_LIMIT,
-    filter_by_gt: bool = False,
+    filter_by_gt: bool = True,
 ) -> pd.DataFrame:
     """
     Гибридное объединение категорий корреляции и CI.
@@ -80,20 +80,25 @@ def run_final_mix(
 
     # Функция выбора и коррекции финальной категории
     def fuse(row):
-        corr_cat = row["corr_cat"]
-        ci_cat   = row["ci_cat"]
+        ci_lvl   = LEVELS[row["ci_cat"]]
+        corr_lvl = LEVELS[row["corr_cat"]]
         dist     = row["distance"]
-        # Выбираем максимальную категорию
-        chosen = ci_cat if LEVELS[ci_cat] > LEVELS[corr_cat] else corr_cat
-        # Приоритет CI, но коррекция на дальнем расстоянии
-        if (
-            chosen == ci_cat
-            and dist > dist_limit
-            and LEVELS[ci_cat] >= LEVELS["impact"]
-            and LEVELS[corr_cat] <= LEVELS["weak"]
-        ):
-            chosen = INV_LEVELS[LEVELS[ci_cat] - 1]
-        return chosen
+
+        # базовый кандидат – сильнейшая метрика
+        chosen_lvl  = max(ci_lvl, corr_lvl)
+        weaker_lvl  = min(ci_lvl, corr_lvl)
+
+        # если пара далёкая, а победитель «impact/medium+»
+        # и второе измерение слабое → понижаем
+        if dist > dist_limit and chosen_lvl >= 2 and weaker_lvl <= 1:
+            step = 1 if weaker_lvl == 1 else 2        # weak → –1, none → –2
+            chosen_lvl = max(0, chosen_lvl - step)
+        if dist < 550 and ci_lvl == 1 and corr_lvl == 1:
+            return "impact"
+        if ci_lvl == 0 and corr_lvl == 1 and dist > CORR_DIST_LIMIT:
+            return "none"
+
+        return INV_LEVELS[chosen_lvl]
 
     base["final_cat"] = base.apply(fuse, axis=1)
     return base[["oil_well", "ppd_well", "distance", "corr_cat", "ci_cat", "final_cat"]]
