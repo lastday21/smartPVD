@@ -1,200 +1,167 @@
-import os
+"""
+* _get_event_dates            — вытаскиваем даты из произвольного
+                                 «PPD-события» (namedtuple / Series / row)
+* select_response_window      — рассчитываем отклик нефтянки
+* make_window_passport        — формируем «паспорт» расчётного окна
+"""
+
+from collections import namedtuple
 import pandas as pd
-import numpy as np
 import pytest
 
+import window_selector as ws
 
-from well_pairs import load_data, merge_with_coords, compute_pairs_within_radius
 
+# ---------------------------------------------------------------------------
+# Глобальный фикстур-патч: ужимаем константы, чтобы тесты работали быстро
+# ---------------------------------------------------------------------------
 
-def write_csv(path: str, df: pd.DataFrame):
+@pytest.fixture(autouse=True)
+def _patch_defaults(monkeypatch):
     """
-    Вспомогательная функция для сохранения DataFrame в CSV (с заголовком и без индекса).
+    Делаем условия «компактными», чтобы не плодить лишних строк
+    и не ждать лишние секунды в расчётах.
     """
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+    monkeypatch.setattr(ws, "LAG_DAYS", 1, raising=False)
+    monkeypatch.setattr(ws, "OIL_CHECK_DAYS", 5, raising=False)
+    monkeypatch.setattr(ws, "OIL_DELTA_P_THRESH", 3.0, raising=False)
+    monkeypatch.setattr(ws, "OIL_EXTEND_DAYS", 10, raising=False)
 
 
-def test_load_data_success(tmp_path):
+# ---------------------------------------------------------------------------
+# _get_event_dates
+# ---------------------------------------------------------------------------
+
+def test_get_event_dates_variants():
+    """Берём даты из трёх разных представлений события."""
+    t0, t1 = pd.Timestamp("2025-01-01"), pd.Timestamp("2025-01-05")
+
+    # 1) namedtuple
+    Ev = namedtuple("Ev", "start end")
+    assert ws._get_event_dates(Ev(t0, t1)) == (t0, t1)
+
+    # 2) pandas.Series c 'start' / 'end'
+    ser = pd.Series({"start": t0, "end": t1})
+    assert ws._get_event_dates(ser) == (t0, t1)
+
+    # 3) строка DataFrame с 'start_date' / 'end_date'
+    row = pd.Series({"start_date": t0, "end_date": t1})
+    assert ws._get_event_dates(row) == (t0, t1)
+
+    # 4) неверный объект → AttributeError
+    with pytest.raises(AttributeError):
+        ws._get_event_dates(object())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# select_response_window
+# ---------------------------------------------------------------------------
+
+def _make_series(start: str, days: int, p_start: float, delta: list[float] | float):
     """
-    Проверяем, что load_data корректно читает файлы, если:
-      - coords содержит колонки ['well','x','y']
-      - oil/ppd содержат колонку ['well']
+    Генерирует мини-DataFrame c 'p_oil' и 'q_oil' для одной скважины.
+    *delta* — либо одно число (константное смещение), либо список по дням.
     """
-    base = tmp_path / "data"
-    base.mkdir()
-
-    # coords_clean.csv
-    coords_df = pd.DataFrame({
-        "well": [1, 2, 3],
-        "x": [100.0, 200.0, 300.0],
-        "y": [10.0, 20.0, 30.0]
-    })
-    coords_path = str(base / "coords_clean.csv")
-    write_csv(coords_path, coords_df)
-
-    # oil_clean.csv (колонка well, с дубликатами)
-    oil_df = pd.DataFrame({
-        "well": [1, 1, 3, 3, 3]
-    })
-    oil_path = str(base / "oil_clean.csv")
-    write_csv(oil_path, oil_df)
-
-    # ppd_clean.csv
-    ppd_df = pd.DataFrame({
-        "well": [2, 2, 2]
-    })
-    ppd_path = str(base / "ppd_clean.csv")
-    write_csv(ppd_path, ppd_df)
-
-    # Вызываем load_data
-    coords_ret, oil_wells_ret, ppd_wells_ret = load_data(coords_path, oil_path, ppd_path)
-
-    # Проверяем, что coords_ret соответствует исходному DataFrame
-    pd.testing.assert_frame_equal(coords_ret.reset_index(drop=True), coords_df)
-
-    # oil_wells_ret и ppd_wells_ret — Series с уникальными well
-    assert isinstance(oil_wells_ret, pd.Series)
-    assert set(oil_wells_ret.tolist()) == {1, 3}
-
-    assert isinstance(ppd_wells_ret, pd.Series)
-    assert set(ppd_wells_ret.tolist()) == {2}
+    idx = pd.date_range(start, periods=days, freq="D")
+    if isinstance(delta, list):
+        p = [p_start + d for d in delta]
+    else:
+        p = [p_start + delta] * days
+    q = [10] * days
+    return pd.DataFrame({"p_oil": p, "q_oil": q, "well": "W-1"}, index=idx)
 
 
-def test_load_data_missing_coords_columns(tmp_path):
+def test_select_basic_window_without_extension():
     """
-    Проверяем, что load_data выбрасывает RuntimeError,
-    если в coords_clean.csv нет колонок 'well','x','y'.
+    ΔP меньше порога — должно вернуться базовое окончание (base_end).
     """
-    base = tmp_path / "data2"
-    base.mkdir()
+    ev = namedtuple("Ev", "start end")(
+        pd.Timestamp("2025-01-01"), pd.Timestamp("2025-01-03")
+    )
+    series = _make_series("2025-01-02", 3, 100.0, [0, 1, -1])
 
-    # coords без колонки 'y'
-    coords_df = pd.DataFrame({
-        "well": [1, 2],
-        "x": [10.0, 20.0],
-        # "y" отсутствует
-        "z": [0, 0]
-    })
-    coords_path = str(base / "coords_bad.csv")
-    write_csv(coords_path, coords_df)
-
-    # oil и ppd корректные
-    oil_df = pd.DataFrame({"well": [1]})
-    oil_path = str(base / "oil_bad.csv")
-    write_csv(oil_path, oil_df)
-
-    ppd_df = pd.DataFrame({"well": [2]})
-    ppd_path = str(base / "ppd_bad.csv")
-    write_csv(ppd_path, ppd_df)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        load_data(coords_path, oil_path, ppd_path)
-    assert "В coords_clean.csv должны быть колонки 'well', 'x' и 'y'" in str(excinfo.value)
+    win = ws.select_response_window(ev, series)
+    assert win == (pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-04"))
 
 
-def test_merge_with_coords_ignores_missing(tmp_path, capsys):
+def test_select_with_extension_and_long_ppd_event():
     """
-    Проверяем, что merge_with_coords:
-      - Возвращает только те well, что есть в coords
-      - Печатает предупреждение о пропущенных скважинах
+    ΔP ≥ порога — окно расширяется до OIL_EXTEND_DAYS,
+    т.к. событие ППД длиннее и не обрезает cand_end.
     """
-    # DataFrame coords
-    coords_df = pd.DataFrame({
-        "well": [10, 20, 30],
-        "x": [0.0, 1.0, 2.0],
-        "y": [0.0, 1.0, 2.0]
-    })
+    ev = namedtuple("Ev", "start end")(
+        pd.Timestamp("2025-01-01"), pd.Timestamp("2025-01-25")
+    )
+    # прыжок давления 7 атм ⇒ расширяем
+    series = _make_series("2025-01-02", 15, 100.0,
+                          [0] + [7] * 14)  # delta_p_max = 7 ≥ 3
 
-    # wells содержит существующие и несуществующие номера
-    wells = pd.Series([20, 30, 40, 50])
-
-    # Вызываем merge_with_coords
-    merged = merge_with_coords(coords_df, wells, kind="test_kind")
-
-    # В merged только well=20 и well=30
-    assert set(merged["well"].tolist()) == {20, 30}
-    # Колонки — ['well','x','y']
-    assert list(merged.columns) == ["well", "x", "y"]
-
-    # Проверяем, что выведено предупреждение о пропущенных [40, 50]
-    captured = capsys.readouterr()
-    assert "следующих test_kind-скважин нет в coords_clean.csv" in captured.out
-    assert "40" in captured.out and "50" in captured.out
+    win = ws.select_response_window(ev, series)
+    # oil_start = 02-01, +9 дней (10 суток) = 11-01
+    assert win == (pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-11"))
 
 
-def test_compute_pairs_within_radius_basic(tmp_path):
+def test_select_trim_to_series_end():
     """
-    Проверяем compute_pairs_within_radius на простом примере:
-    - Три нефтянки: A(0,0), B(10,0), C(0,10)
-    - Две ППД: P1(0,1), P2(20,20)
-    При radius=5 должна остаться только пара (A,P1) с distance=1.
+    cand_end выходит за предел имеющихся данных —
+    функция обязана «обрезать» конец.
     """
-    oil_coords_df = pd.DataFrame({
-        "well": [1, 2, 3],
-        "x": [0.0, 10.0, 0.0],
-        "y": [0.0, 0.0, 10.0]
-    })
-    ppd_coords_df = pd.DataFrame({
-        "well": [100, 200],
-        "x": [0.0, 20.0],
-        "y": [1.0, 20.0]
-    })
+    ev = namedtuple("Ev", "start end")(
+        pd.Timestamp("2025-01-01"), pd.Timestamp("2025-01-20")
+    )
+    series = _make_series("2025-01-02", 5, 100.0, 5)  # всего 5 суток
 
-    df_pairs = compute_pairs_within_radius(oil_coords_df, ppd_coords_df, radius=5.0)
-
-    # Ожидаем ровно одну пару
-    assert len(df_pairs) == 1
-
-    # Структура столбцов
-    assert list(df_pairs.columns) == ["oil_well", "ppd_well", "distance"]
-
-    row = df_pairs.iloc[0]
-    assert row["oil_well"] == 1
-    assert row["ppd_well"] == 100
-    # distance может быть np.integer или int
-    assert isinstance(row["distance"], (int, np.integer))
-    assert int(row["distance"]) == 1  # округление 1.0 → 1
+    win = ws.select_response_window(ev, series)
+    # конец равен последнему дню в серии
+    assert win == (pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-06"))
 
 
-def test_compute_pairs_within_radius_sorting(tmp_path):
+@pytest.mark.parametrize(
+    "series",
+    [
+        pd.DataFrame(),                                  # пустой DF
+        _make_series("2025-01-10", 5, 100.0, 0).drop(columns="p_oil"),  # нет давления
+    ],
+)
+def test_select_returns_none_on_insufficient_data(series):
+    """Должен вернуться None, если данных недостаточно."""
+    ev = namedtuple("Ev", "start end")(
+        pd.Timestamp("2025-01-01"), pd.Timestamp("2025-01-05")
+    )
+    assert ws.select_response_window(ev, series) is None
+
+
+# ---------------------------------------------------------------------------
+# make_window_passport
+# ---------------------------------------------------------------------------
+
+def test_passport_happy_path():
     """
-    Проверяем сортировку compute_pairs_within_radius:
-    - Два oil: 1(0,0), 2(0,2)
-    - Две ppd: 10(0,1), 20(0,3)
-    При radius=5 получаем четыре пары:
-      (1,10)=1
-      (1,20)=3
-      (2,10)=1
-      (2,20)=1
-    Ожидаем порядок:
-      (1,10,1), (1,20,3), (2,10,1), (2,20,1)
+    Формируем паспорт и сверяем ключевые поля.
     """
-    oil_coords_df = pd.DataFrame({
-        "well": [1, 2],
-        "x": [0.0, 0.0],
-        "y": [0.0, 2.0]
-    })
-    ppd_coords_df = pd.DataFrame({
-        "well": [10, 20],
-        "x": [0.0, 0.0],
-        "y": [1.0, 3.0]
-    })
+    dates = pd.date_range("2025-01-02", periods=3, freq="D")
+    df = pd.DataFrame(
+        {
+            "p_oil": [100, 101, 102],
+            "q_oil": [10, 11, 12],
+            "field": "Южное",
+            "well": "W-77",
+        },
+        index=dates,
+    )
+    start, end = dates[0], dates[-1]
+    passport = ws.make_window_passport(df, start, end)
 
-    df_pairs = compute_pairs_within_radius(oil_coords_df, ppd_coords_df, radius=5.0)
-
-    # Ожидаем 4 строки
-    assert len(df_pairs) == 4
-
-    # Проверяем порядок (oil_well, ppd_well, distance)
-    expected = [
-        (1, 10, 1),
-        (1, 20, 3),
-        (2, 10, 1),
-        (2, 20, 1),
-    ]
-    actual = list(df_pairs.itertuples(index=False, name=None))
-    assert actual == expected
+    assert passport["well"] == "W-77"
+    assert passport["oil_start"] == start
+    assert passport["oil_end"] == end
+    assert passport["duration_days_oil"] == 3
+    # дополнительное поле «field» должно сохраниться
+    assert passport["field"] == "Южное"
 
 
-if __name__ == "__main__":
-    pytest.main([os.path.abspath(__file__)])
+def test_passport_returns_none_when_dates_missing():
+    """Если в DF нет строки на oil_end, получаем None."""
+    df = _make_series("2025-01-02", 2, 100.0, 0)  # только 2 дня
+    start, end = pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-04")
+    assert ws.make_window_passport(df, start, end) is None

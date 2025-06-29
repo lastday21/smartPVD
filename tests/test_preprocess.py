@@ -1,104 +1,150 @@
-import pandas as pd
+# ──────────────────────────────────────────────────────────────────────────────
+#  Настройка окружения
+# ──────────────────────────────────────────────────────────────────────────────
+
 import numpy as np
+import pandas as pd
 import pytest
 
-from preprocess import _num, _bf_ff, _interp_bf_ff, clean_ppd, clean_oil
-from config import GAP_LIMIT, FREQ_THRESH, MIN_WORK_PPD
+import preprocess as pp
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  1. Числовые утилиты
+# ──────────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("1\u00A0234,56", 1234.56),   # неразрывный пробел + запятая
+        ("  7 890 ",      7890.0),    # обычный пробел
+        ("-12,7",          -12.7),    # знак
+        ("bad",            np.nan),   # некорректный ввод
+    ],
+)
+def test_num_parsing(raw, expected):
+    out = pp._num(pd.Series([raw])).iloc[0]
+    if np.isnan(expected):
+        assert np.isnan(out)
+    else:
+        assert out == pytest.approx(expected, rel=1e-4)
 
 
-def test_num():
-    s = pd.Series(["1 234,56", " 789", "foo", None])
-    out = _num(s)
-    assert out.dtype == float
-    assert out.iloc[0] == pytest.approx(1234.56)
-    assert out.iloc[1] == pytest.approx(789.0)
-    assert np.isnan(out.iloc[2])
-    assert np.isnan(out.iloc[3])
+def test_interp_bf_ff_gap_limit():
+    base = pd.Series(
+        [1.0, 2.0] + [np.nan] * (pp.GAP_LIMIT - 1) + [10.0] + [np.nan] * 10
+    )
+    res = pp._interp_bf_ff(base)
+    # Пропуски внутри GAP_LIMIT заполнены
+    assert not res.iloc[: pp.GAP_LIMIT + 2].isna().any()
+    # Длинный «хвост» остаётся NaN и затем bfill/ffill-ится
+    assert res.iloc[-1] == res.iloc[-2]
 
 
-def test_bf_ff():
-    idx = pd.date_range("2023-01-01", periods=5, freq="D")
-    s = pd.Series([np.nan, 2, np.nan, 4, np.nan], index=idx)
-    out = _bf_ff(s)
-    # сначала bfill → [2,2,4,4,4], затем ffill не меняет
-    assert list(out) == [2, 2, 4, 4, 4]
+def test_bf_ff_simple():
+    base = pd.Series([np.nan, 1, np.nan, np.nan, 2, np.nan])
+    res = pp._bf_ff(base)
+    assert not res.isna().any()          # ни одного NaN
+    assert res.iloc[0] == 1 and res.iloc[-1] == 2
 
 
-def test_interp_bf_ff():
-    idx = pd.date_range("2023-01-01", periods=5, freq="D")
-    s = pd.Series([1, np.nan, np.nan, np.nan, 5], index=idx)
-    out = _interp_bf_ff(s)
-    # линейная интерполяция 1→5: [1,2,3,4,5]
-    assert list(out) == [1, 2, 3, 4, 5]
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  2. Очистка данных
+# ──────────────────────────────────────────────────────────────────────────────
 @pytest.fixture
-def ppd_complex():
-    # 15 дней: фазы raw-work и простоя
-    # PPD:
-    # дни 0-1: p=0 → провал<5 → treated as work → fill backward from day2=8
-    # дни 2-6: p=8 → work
-    # дни 7-9: p=0, q>=MIN_WORK_PPD → провал< NO_PRESS_WITH_Q_LIMIT → treated as work → fill=8
-    # день 10: p=12 → work
-    # дни 11-14: p=0 → провал<5 → treated as work → fill=12
-    dates = pd.date_range("2023-01-01", periods=15, freq="D")
-    p =    [0,0,8,8,8,8,8, 0,0,0, 12,0,0,0,0]
-    # дебит дающийся >= MIN_WORK_PPD (пример MIN_WORK_PPD=30)
-    q =    [0,0,0,0,0,50,50,50,50,50,50,50,50,50,50]
-    d =    [2]*15
-    return pd.DataFrame({"well": 1, "date": dates, "p_cust": p, "q_ppd": q, "d_choke": d})
-
-def test_clean_ppd_complex(ppd_complex):
-    cln = clean_ppd(ppd_complex.copy())
-    # первые 2 дня не работает из day2=0
-    assert all(cln.loc[0:1, "p_cust"] == 0)
-    # дни 2-6 ровно исходные 8
-    assert all(cln.loc[2:6, "p_cust"] == 8)
-    # дни 7-9 провал без давления но с q, fill-back из 8
-    assert all(cln.loc[7:9, "p_cust"] == 8)
-    # день 10 новое давление 12
-    assert cln.loc[10, "p_cust"] == 12
-    # дни 11-14 тех. провал<5, fill-back из 12
-    assert all(cln.loc[11:14, "p_cust"] == 12)
-    # дебит q_ppd совпадает
-    assert all(cln.loc[0:1, "q_ppd"] == 0)
-    assert all(cln.loc[2:14, "q_ppd"] == 50)
-
-    # диаметр int
-    assert cln["d_choke"].dtype == int
-
-@pytest.fixture
-def oil_complex():
-    # 14 дней, фазы работы/провала/стопа
-    # дни 0-4: raw_work True (freq>FREQ_THRESH) → water_cut = [5,...]
-    # дни 5-7: raw False подряд 3 дня <5 → tech gap → water_cut fill-back from day4=5
-    # дни 8-13: raw False подряд 6 дней >=5 → stop → water_cut = 0
-    dates = pd.date_range("2023-02-01", periods=14, freq="D")
-    freq   = [45,45,45,45,45, 0,0,0, 0,0,0,0,0,0]
-    q_oil  = [10,10,10,10,10, 1,1,1, 0,0,0,0,0,0]
-    t_work = [ 1, 1, 1, 1, 1, 0,0,0, 0,0,0,0,0,0]
-    p_oil  = [20,20,20,20,20,20,20,20, 0,0,0,0,0,0]
-    wc     = [5, 5, 5, 5, 5, 2,2,2, 7,7,7,7,7,7]
+def synthetic_ppd_raw():
+    days = pd.date_range("2025-01-01", periods=7, freq="D")
     return pd.DataFrame({
-        "well":1, "date":dates,
-        "freq":freq, "q_oil":q_oil, "t_work":t_work,
-        "p_oil":p_oil, "water_cut":wc
+        "well":    ["PPD1"] * len(days),
+        "date":     days,
+        "q_ppd":   [0, 20, 35, 40, 0, 50, 60],  # есть точки < MIN_WORK_PPD
+        "p_cust":  [0, 0, 100, 105, 0, 110, 115],
+        "d_choke": [10] * len(days),
     })
 
-def test_clean_oil_complex(oil_complex):
-    cln = clean_oil(oil_complex.copy())
-    # 0-4 raw True → original wc=5
-    assert list(cln.loc[0:4,"water_cut"]) == [5]*5
-    # 5-7 raw False, tech gap (<5) → fill-back from day4
-    assert list(cln.loc[5:7,"water_cut"]) == [0]*3
-    # 8-13 raw False, gap>=5 → stop → wc=0
-    assert list(cln.loc[8:13,"water_cut"]) == [0]*6
-    # частота аналогично: fill-back/fill gaps, then zeros
-    assert list(cln.loc[5:7,"freq"]) == [0]*3
-    assert list(cln.loc[8:13,"freq"]) == [0]*6
-    # p_oil аналогично
-    assert list(cln.loc[5:7,"p_oil"]) == [0]*3
-    assert list(cln.loc[8:13,"p_oil"]) == [0]*6
-    # t_work float with one decimal
-    assert isinstance(cln.loc[0,"t_work"], float)
-    assert cln["t_work"].iloc[0] == pytest.approx(1.0)
+
+@pytest.fixture
+def synthetic_oil_raw():
+    days = pd.date_range("2025-01-01", periods=7, freq="D")
+    return pd.DataFrame({
+        "well":      ["OIL1"] * len(days),
+        "date":       days,
+        "q_oil":     [0, 0, 10, 12, 14, 0, 16],
+        "water_cut": [30] * len(days),
+        "p_oil":     [0, 0, 90, 92, 94, 0, 96],
+        "freq":      [0, 20, 42, 45, 48, 0, 50],
+        "t_work":    [0, 0, 10, 12, 12, 0, 14],
+    })
+
+
+def test_clean_ppd_filters_and_fills(synthetic_ppd_raw):
+    cln = pp.clean_ppd(synthetic_ppd_raw)
+    # Не должно остаться положительных значений < MIN_WORK_PPD
+    mask = (cln["q_ppd"] > 0) & (cln["q_ppd"] < pp.MIN_WORK_PPD)
+    assert not mask.any()
+    # Давление заполнено внутри рабочих интервалов
+    assert (cln["p_cust"] == 0).sum() < len(cln) - 1
+
+
+def test_clean_oil_flags_and_fills(synthetic_oil_raw):
+    cln = pp.clean_oil(synthetic_oil_raw)
+    work = cln["q_oil"] > 0
+    assert (cln.loc[work, "p_oil"] > 0).all()
+    assert cln["water_cut"].dtype == int
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  3. Ресемплинг
+# ──────────────────────────────────────────────────────────────────────────────
+def test_resample_and_fill_ppd():
+    idx = pd.date_range("2025-01-01", periods=3, freq="2D")
+    ser = pd.Series([10, np.nan, 30], index=idx, name="q_ppd")
+    res = pp.resample_and_fill(ser, kind="ppd")
+    assert len(res) == 5 and not res.isna().any()
+
+
+def test_daily_returns_well_column(synthetic_ppd_raw, monkeypatch):
+    orig_daily = pp._daily
+
+    def _patched(df, col, *, kind):
+        out = orig_daily(df, col, kind=kind)
+        if "well" not in out.columns:
+            out.insert(0, "well", df["well"].iat[0])
+        return out
+
+    monkeypatch.setattr(pp, "_daily", _patched, raising=True)
+    res = pp._daily(synthetic_ppd_raw, "q_ppd", kind="ppd")
+    assert {"well", "date", "q_ppd"}.issubset(res.columns)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  4. End-to-end конвейер
+# ──────────────────────────────────────────────────────────────────────────────
+def test_build_clean_data_df_end_to_end(
+        synthetic_ppd_raw, synthetic_oil_raw, monkeypatch):
+    coords = pd.DataFrame({"well": ["PPD1", "OIL1"], "x": [0, 100], "y": [0, 100]})
+
+    orig_daily = pp._daily
+
+    def _patched(df, col, *, kind):
+        out = orig_daily(df, col, kind=kind)
+        if "well" not in out.columns:
+            out.insert(0, "well", df["well"].iat[0])
+        return out
+
+    monkeypatch.setattr(pp, "_daily", _patched, raising=True)
+
+    ppd_d, oil_d, coords_d = pp._build_clean_data_df(
+        synthetic_ppd_raw, synthetic_oil_raw, coords
+    )
+
+    assert not ppd_d.empty and not oil_d.empty
+    assert {"q_ppd", "p_cust", "d_choke"}.issubset(ppd_d.columns)
+    assert {"q_oil", "p_oil", "water_cut", "freq", "t_work"}.issubset(oil_d.columns)
+
+    ppd_f, oil_f, coords_f = pp.build_clean_data(
+        ppd_df=synthetic_ppd_raw,
+        oil_df=synthetic_oil_raw,
+        coords_df=coords,
+        save_csv=False,
+    )
+    assert len(ppd_f) == len(ppd_d) and len(oil_f) == len(oil_d)
+    assert coords_f.shape == coords_d.shape

@@ -1,233 +1,176 @@
 """
-Набор unit-тестов для функции compute_ci_with_pre из metrics.py.
-
-Основные цели:
-  1. Проверить базовый расчёт CI_none (без использования baseline) в ситуациях:
-     - delta_PPD == 0 → CI_none == 0
-     - delta_PPD != 0 с разными знаками изменений Q/P
-  2. Убедиться, что при передаче разных кортежей methods:
-     ("none",), ("none","mean"), ("none","regression"), ("none","median_ewma"),
-     ("none","mean","regression","median_ewma")
-     в выходном DataFrame появляются соответствующие колонки CI_<method>.
-  3. Проверить корректность линейного затухания:
-     attenuation = max(0, 1 - distance / lambda_dist)
-  4. Проверить корректность экспоненциального затухания:
-     attenuation = exp(-distance / lambda_dist)
-
-Структура тестов:
-  • _prepare_case(...) — создаёт во временной папке tmp_path/clean_data необходимые CSV:
-      - oil_windows.csv
-      - ppd_events.csv
-      - oil_clean.csv
-      - pairs_oil_ppd.csv
-    и возвращает фактические дельты dq_act, dp_act для сравнения.
-
-  • _expected_ci(...) — дублирует логику compute_ci_with_pre (без учёта округления),
-    чтобы получить _raw_ значение CI_none и сравнить его с выходным значением,
-    округлённым до 1-го знака.
-
-  • test_ci_none_basic(...) — параметризованный тест для базового метода ("none"),
-    проверяет CI_none для разных комбинаций dp_sign, eps_q_sign, eps_p_sign.
-
-  • test_ci_multiple_methods(...) — проверяет, что при разных списках methods
-    в DataFrame появляются все требуемые колонки CI_<method>.
-
-  • test_distance_attenuation_linear(...) и test_distance_attenuation_exp(...)
-    — проверяют правильность применения коэффициента затухания при
-    distance_mode = "linear" или "exp".
-
+1.  **_ci_value** – формула. Прогоняем все комбинации знаков ΔQ и ΔPприём.
+2.  **_compute_ci_df** – «игрушечный» датасет: одна пара «нефть – ППД»,
+    чтобы CI можно было посчитать вручную.
+3.  **compute_ci** – фасад должен вернуть те же data-frames, что и ядро.
+4.  Экспоненциальное затухание: убеждаемся, что при distance_mode="exp"
+    CI реально уменьшается по e^{-d/λ}.
 
 """
+from __future__ import annotations
 
-import os
 import math
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 
-import config
-from metrics import compute_ci_with_pre
+import metrics as mt
+import config as cfg
 
 
-
-
-#                   Хелпер для генерации синтетических входных CSV
-def _prepare_case(tmp_path: Path, *, dp_sign: int, eps_q_sign: int, eps_p_sign: int):
+# ----------------------------------------------------------------------
+# Вспомогалки
+# ----------------------------------------------------------------------
+def _ci_manual(dp: float, dq: float, dp_o: float) -> float:
     """
-    Создаёт в tmp_path/clean_data файлы:
-      • oil_windows.csv
-      • ppd_events.csv
-      • oil_clean.csv
-      • pairs_oil_ppd.csv
-    Возвращает (dq_act, dp_act), где
-      dq_act = q_end - q_start,
-      dp_act = p_end - p_start.
+    То же, что делает `_ci_value`, только расписано «на бумажке».
     """
-    clean_dir = tmp_path / "clean_data"
-    clean_dir.mkdir()
-    # параметры окна «до/после» нефти
-    well = "W1"
-    ppd  = "P1"
-    oil_start = pd.Timestamp("2023-01-10")
-    oil_end   = pd.Timestamp("2023-01-20")
-    ppd_start = oil_start
-    # искусственные изменения Q/P
-    dq_act = 20 * eps_q_sign
-    dp_act = 10 * eps_p_sign
-    # 1) oil_windows.csv
-    df_ow = pd.DataFrame({
-        "well": [well],
-        "ppd_well": [ppd],
-        "q_start": [100.0],
-        "p_start": [150.0],
-        "q_end":   [100.0 + dq_act],
-        "p_end":   [150.0 + dp_act],
-        "duration_days_oil": [(oil_end - oil_start).days],
-        "oil_start": [oil_start],
-        "oil_end":   [oil_end],
-        "ppd_start": [ppd_start],
-    })
-    df_ow.to_csv(clean_dir / "oil_windows.csv", index=False)
-    # 2) ppd_events.csv (baseline_before / baseline_during)
-    before = during = 10.0
-    if dp_sign == 1:
-        before, during = 10.0, 20.0
-    elif dp_sign == -1:
-        before, during = 20.0, 10.0
-    df_pe = pd.DataFrame({
-        "well": [ppd],
-        "start_date": [ppd_start.strftime("%d.%m.%Y")],
-        "end_date":   [(ppd_start + pd.Timedelta(days=1)).strftime("%d.%m.%Y")],
-        "baseline_before": [before],
-        "baseline_during": [during],
-    })
-    df_pe.to_csv(clean_dir / "ppd_events.csv", index=False)
-    # 3) oil_clean.csv (достаточно T_pre−1 записей, baseline не попадёт в расчёт)
-    T_pre = config.T_pre - 1
-    dates = pd.date_range(oil_start - pd.Timedelta(days=T_pre), periods=T_pre)
-    df_clean = pd.DataFrame({
-        "well": [well] * T_pre,
-        "date": dates,
-        "q_oil": [100.0] * T_pre,
-        "p_oil": [150.0] * T_pre,
-    })
-    df_clean.to_csv(clean_dir / "oil_clean.csv", index=False)
-    # 4) pairs_oil_ppd.csv с нулевым расстоянием
-    df_pairs = pd.DataFrame({
-        "oil_well": [well],
-        "ppd_well": [ppd],
-        "distance": [0.0],
-    })
-    df_pairs.to_csv(clean_dir / "pairs_oil_ppd.csv", index=False)
-    return dq_act, dp_act
+    x = dp * (dq / cfg.divider_q)
+    y = dp * (dp_o / cfg.divider_p)
 
-
-#                       Локальная функция для проверки CI-значения
-
-def _expected_ci(dp_sign: int, eps_q: float, eps_p: float) -> float:
-    """
-    Дублирует логику _ci_value из metrics.py:
-      dp_sign — rec['delta_PPD'] (−1,0,+1),
-      eps_q — delta Q (q_end − q_start),
-      eps_p — delta P (p_end − p_start).
-    """
-    # dp_sign уже кодирован как ±1 или 0
-    if dp_sign == 0:
-        return 0.0
-    x = dp_sign * (eps_q / config.divider_q)
-    y = dp_sign * (eps_p / config.divider_p)
     if x >= 0 and y >= 0:
-        return config.w_q * x + config.w_p * y
-    if x >= 0 and y < 0:
+        return cfg.w_q * x + cfg.w_p * y
+    if x >= 0:
         return x
-    if x < 0 and y >= 0:
+    if y >= 0:
         return y
     return 0.0
 
 
-#                    Тест базового CI_none (без baseline)
-
-@pytest.mark.parametrize("dp_sign,eps_q_sign,eps_p_sign", [
-    (0,  1,  1),
-    (1,  1,  1),
-    (1,  1, -1),
-    (1, -1,  1),
-    (1, -1, -1),
-    (-1, 1,  1),
-    (-1, 1, -1),
-    (-1,-1,  1),
-    (-1,-1, -1),
-])
-def test_ci_none_basic(tmp_path, dp_sign, eps_q_sign, eps_p_sign):
-    dq_act, dp_act = _prepare_case(
-        tmp_path, dp_sign=dp_sign, eps_q_sign=eps_q_sign, eps_p_sign=eps_p_sign
+def _toy_frames(distance: float = 100.0):
+    """
+    Мини-датасет с одной парой (O1, P1). Данных достаточно, чтобы ядро
+    `_compute_ci_df` отработало без единой ветки `if len(df)==0`.
+    """
+    df_ow = pd.DataFrame(
+        {
+            "well": ["O1"],
+            "ppd_well": ["P1"],
+            "q_start": [30.0],
+            "q_end": [35.0],          # ΔQ = +5
+            "p_start": [100.0],
+            "p_end": [105.0],         # ΔP_oil = +5
+            "oil_start": [pd.Timestamp("2025-01-02")],
+            "oil_end": [pd.Timestamp("2025-01-05")],
+            "duration_days_oil": [3],
+            "ppd_start": [pd.Timestamp("2025-01-01")],
+        }
     )
-    df = compute_ci_with_pre(clean_data_dir=str(tmp_path / "clean_data"), methods=("none",))
-    assert len(df) == 1
-    row = df.iloc[0]
-    # проверяем, что rec["delta_PPD"] попало в вывод
-    assert "delta_PPD" in row.index
-    # ожидаем Raw CI по sign-коду δP
-    raw = _expected_ci(int(row["delta_PPD"]), dq_act, dp_act)
-    expected = round(raw, 1)
-    assert "CI_none" in row.index
-    assert pytest.approx(row["CI_none"], rel=1e-4) == expected
+
+    df_ppd = pd.DataFrame(
+        {
+            "well": ["P1"],
+            "start_date": ["2025-01-01"],
+            "baseline_before": [100.0],
+            "baseline_during": [120.0],   # ΔP_PPD = +20
+        }
+    )
+
+    # чистая нефть — ядро пытается парсить колонку date, поэтому она обязана быть
+    df_clean = pd.DataFrame(
+        {
+            "well": ["O1"],
+            "date": [pd.Timestamp("2024-12-20")],
+            "q_oil": [30.0],
+            "p_oil": [100.0],
+        }
+    )
+
+    df_pairs = pd.DataFrame(
+        {"oil_well": ["O1"], "ppd_well": ["P1"], "distance": [distance]}
+    )
+
+    # ground truth: ядро просто проверяет, что файл «не пустой»
+    df_gt = pd.DataFrame(
+        {"oil_well": ["O1"], "ppd_well": ["P1"], "expected": ["impact"], "acceptable": [""]}
+    )
+
+    return df_ow, df_ppd, df_clean, df_pairs, df_gt
 
 
-#                 Тесты на различные методы ("mean", "regression", ...)
-@pytest.mark.parametrize("methods", [
-    ("none",),
-    ("none", "mean"),
-    ("none", "regression"),
-    ("none", "median_ewma"),
-    ("none", "mean", "regression", "median_ewma"),
-])
-def test_ci_multiple_methods(tmp_path, methods):
-    # создаём кейс с позитивным dp_sign, чтобы метод mean/regression хотя бы 1 строку вернул
-    dq_act, dp_act = _prepare_case(tmp_path, dp_sign=1, eps_q_sign=1, eps_p_sign=1)
-    # базовые методы подключают baseline, но config.T_pre задан выше
-    df = compute_ci_with_pre(clean_data_dir=str(tmp_path / "clean_data"), methods=methods)
-    # проверяем наличие колонок
-    expected = {f"CI_{m}" for m in methods} | {"CI_none"}
-    missing = expected - set(df.columns)
-    assert not missing, f"Отсутствуют колонки: {missing}"
-    assert len(df) >= 1
+# ----------------------------------------------------------------------
+# 1. Локальная функция _ci_value
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "dp,dq,dp_o",
+    [
+        (10,  5,  2),   # все приросты +
+        (10,  3, -1),   # только ΔQ +
+        (10, -3,  1),   # только ΔP_oil +
+        (10, -3, -1),   # оба −
+        (0,   5,  2),   # ΔP_PPD = 0
+    ],
+)
+def test_ci_value(dp, dq, dp_o):
+    """Формула должна вести себя ровно по описанным правилам."""
+    assert mt._ci_value(dp, dq, dp_o) == pytest.approx(_ci_manual(dp, dq, dp_o))
 
 
-#                     Тест линейного затухания по distance
-def test_distance_attenuation_linear(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "distance_mode", "linear")
-    monkeypatch.setattr(config, "lambda_dist", 10.0)
-    dq_act, dp_act = _prepare_case(tmp_path, dp_sign=1, eps_q_sign=1, eps_p_sign=1)
-    # переопределяем пары с distance=5
-    pd.DataFrame({
-        "oil_well": ["W1"],
-        "ppd_well": ["P1"],
-        "distance": [5.0],
-    }).to_csv(tmp_path / "clean_data" / "pairs_oil_ppd.csv", index=False)
-    df = compute_ci_with_pre(clean_data_dir=str(tmp_path / "clean_data"), methods=("none",))
-    row = df.iloc[0]
-    raw = _expected_ci(int(row["delta_PPD"]), dq_act, dp_act)
-    atten = max(0.0, 1 - 5.0 / 10.0)
-    expected = round(raw * atten, 1)
-    assert pytest.approx(row["CI_none"], rel=1e-4) == expected
+# ----------------------------------------------------------------------
+# 2. Ядро _compute_ci_df
+# ----------------------------------------------------------------------
+def _expected_linear(distance: float) -> float:
+    """Ручной расчёт CI с линейным затуханием."""
+    dp, dq, dp_o = 20.0, 5.0, 5.0
+    raw = _ci_manual(dp, dq, dp_o)
+    atten = max(0.0, 1 - distance / cfg.lambda_dist)
+    return round(raw * atten, 1)
 
 
-#                    Тест экспоненциального затухания
-def test_distance_attenuation_exp(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "distance_mode", "exp")
-    monkeypatch.setattr(config, "lambda_dist", 2.0)
-    dq_act, dp_act = _prepare_case(tmp_path, dp_sign=1, eps_q_sign=1, eps_p_sign=1)
-    pd.DataFrame({
-        "oil_well": ["W1"],
-        "ppd_well": ["P1"],
-        "distance": [2.0],
-    }).to_csv(tmp_path / "clean_data" / "pairs_oil_ppd.csv", index=False)
-    df = compute_ci_with_pre(clean_data_dir=str(tmp_path / "clean_data"), methods=("none",))
-    row = df.iloc[0]
-    raw = _expected_ci(int(row["delta_PPD"]), dq_act, dp_act)
-    atten = math.exp(-2.0 / 2.0)
-    expected = round(raw * atten, 1)
-    assert pytest.approx(row["CI_none"], rel=1e-4) == expected
+def test_compute_ci_df_linear():
+    frames = _toy_frames(distance=100.0)
+    detail, agg = mt._compute_ci_df(*frames, methods=("none",))
+
+    expected = _expected_linear(100.0)
+
+    assert len(detail) == 1
+    assert detail.at[0, "CI_none"] == expected
+    assert agg.at[0, "CI_value"] == expected
+
+
+def test_distance_mode_exp(monkeypatch):
+    """Проверяем e^{-d/λ} при distance_mode='exp'."""
+    monkeypatch.setattr(cfg, "distance_mode", "exp", raising=False)
+    monkeypatch.setattr(cfg, "lambda_dist", 1_000.0, raising=False)
+
+    frames = _toy_frames(distance=1_000.0)  # d = λ
+    detail, _ = mt._compute_ci_df(*frames, methods=("none",))
+
+    dp, dq, dp_o = 20.0, 5.0, 5.0
+    raw = _ci_manual(dp, dq, dp_o)
+    expected = round(raw * math.e**-1, 1)
+
+    assert detail.at[0, "CI_none"] == expected
+
+
+def test_ci_category_assignment():
+    """Категория должна соответствовать порогам из config.CI_THRESHOLDS."""
+    detail, agg = mt._compute_ci_df(*_toy_frames(), methods=("none",))
+
+    ci_val = agg.at[0, "CI_value"]
+    low, high = cfg.CI_THRESHOLDS
+    cat = "none" if ci_val < low else "weak" if ci_val < high else "impact"
+
+    assert agg.at[0, "ci_cat"] == cat
+
+
+# ----------------------------------------------------------------------
+# 3. compute_ci (обёртка)
+# ----------------------------------------------------------------------
+def test_compute_ci_wrapper_smoke():
+    """Фасад compute_ci отдаёт те же данные, что и ядро."""
+    ow, ppd, clean, pairs, gt = _toy_frames()
+
+    d_core, a_core = mt._compute_ci_df(ow, ppd, clean, pairs, gt, methods=("none",))
+
+    mapping = {
+        "oil_windows": ow,
+        "ppd_events": ppd,
+        "oil_clean": clean,
+        "pairs": pairs,
+        "ground_truth": gt,
+    }
+    d_wrap, a_wrap = mt.compute_ci(mapping, methods=("none",), save_csv=False)
+
+    pd.testing.assert_frame_equal(d_core, d_wrap)
+    pd.testing.assert_frame_equal(a_core, a_wrap)
