@@ -22,8 +22,6 @@
 ==========================================================================
 """
 from __future__ import annotations
-
-import os
 from datetime import timedelta
 from pathlib import Path
 from typing import List, Tuple
@@ -158,7 +156,8 @@ def _detect_ppd_events_df(ppd_df: pd.DataFrame) -> pd.DataFrame:
                 event_max = max(init_vals)
 
                 # Перезапуск окна
-                window.clear(); window.extend(devs)
+                window.clear()
+                window.extend(devs)
                 devs.clear()
                 in_event = True
 
@@ -212,13 +211,15 @@ def _detect_ppd_events_df(ppd_df: pd.DataFrame) -> pd.DataFrame:
                 })
 
                 # --- Возможное продолжение (несколько событий подряд) ----
-                window.clear(); window.extend(devs)
+                window.clear()
+                window.extend(devs)
                 start_date = devs[0][0]
                 baseline_before = baseline_during
                 baseline_during = _mean([v for (_, v) in devs])
                 event_min = min([v for (_, v) in devs])
                 event_max = max([v for (_, v) in devs])
-                devs.clear(); in_event = True
+                devs.clear()
+                in_event = True
 
         # --- 2. Обрезаем «хвост» незакрытого события ---------------------
         if in_event and window:

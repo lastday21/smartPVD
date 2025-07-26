@@ -99,8 +99,47 @@
     • Seed фиксирует только выбор «ранних» конфигов.
     • MedianPruner досрочно прерывает неудачные trials.
 """
-
 from __future__ import annotations
+import os
+import logging
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
+from optuna.logging import set_verbosity, WARNING
+import contextlib
+import hashlib
+import itertools
+import time
+import threading
+from threading import Event
+from multiprocessing import Manager
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+import joblib
+import pandas as pd
+
+# ─── SmartPVD core ────────────────────────────────────────────────────────
+import sys
+import config
+import preprocess
+import events_PPD
+import well_pairs
+import oil_windows
+import metrics
+import correl
+import final_mix
+
+set_verbosity(WARNING)
+optuna.logging.disable_default_handler()
+_lg = logging.getLogger("optuna")
+_lg.setLevel(logging.WARNING)
+_lg.handlers.clear()
+_lg.propagate = False
+
+ROOT = Path(__file__).resolve().parent
+sys.path.append(str(ROOT))
+
+
 
 # ─────────────── БЛОК НАСТРОЙКИ ────────────────────────────────────────────
 QUICK_MODE   = False    # True → quick (4 ранних × 70 trials), False → полный (96 × 500)
@@ -111,42 +150,12 @@ FULL_TRIALS  = 10000      # trials в full
 SEED         = 42       # фиксированный seed для воспроизводимости TPE
 # ──────────────────────────────────────────────────────────────────────────
 
-import os
+
 # Каждая копия процесса займёт ровно 1 ядро для BLAS
 os.environ["OMP_NUM_THREADS"]      = "1"
 os.environ["MKL_NUM_THREADS"]      = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-import logging
-import optuna
-from optuna.logging import set_verbosity, WARNING
-set_verbosity(WARNING)
-optuna.logging.disable_default_handler()
-_lg = logging.getLogger("optuna")
-_lg.setLevel(logging.WARNING)
-_lg.handlers.clear()
-_lg.propagate = False
-
-import contextlib
-import hashlib
-import itertools
-import time
-import threading
-from threading import Event
-from multiprocessing import Manager
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
-import joblib
-import pandas as pd
-
-# ─── SmartPVD core ────────────────────────────────────────────────────────
-import sys
-ROOT = Path(__file__).resolve().parent
-sys.path.append(str(ROOT))
-
-import config, preprocess, events_PPD, well_pairs, oil_windows  # noqa: E402
-import metrics, correl, final_mix                               # noqa: E402
 
 # ─── Пары сеток ───────────────────────────────────────────────────────────
 EARLY_GRID = {
@@ -343,11 +352,6 @@ def make_objective(early: Dict[str, Any], counter, lock):
 
 # ─── Работа по одному процессу ────────────────────────────────────────────
 def run_one(idx: int, ec: dict, trials: int, counter, lock):
-    import logging, optuna
-    from optuna.samplers import TPESampler
-    from optuna.pruners  import MedianPruner
-    from optuna.logging  import set_verbosity, WARNING
-
     set_verbosity(WARNING)
     optuna.logging.disable_default_handler()
     _lg = logging.getLogger("optuna")

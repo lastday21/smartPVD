@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Этот модуль содержит две основные функции:
   1. select_response_window(ev_ppd, series) -> (oil_start, oil_end) | None
@@ -14,6 +12,7 @@ from __future__ import annotations
   • pandas.DataFrame-строка с колонками `start_date` и `end_date`
 """
 
+from __future__ import annotations
 from typing import Optional, Tuple, Dict, Any
 import pandas as pd
 

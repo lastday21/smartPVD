@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Dict, Tuple, List, Union, Mapping, Sequence
+from typing import Dict, Tuple, Union, Mapping, Sequence
 
 import pandas as pd
 

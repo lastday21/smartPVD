@@ -114,14 +114,16 @@ def clean_ppd(df: pd.DataFrame) -> pd.DataFrame:
                         start = len(work_flag) - (no_pq - 1)
                         for k in range(start, len(work_flag)):
                             work_flag[k] = False
-                        in_work = False; no_pq = no_both = 0
+                        in_work = False
+                        no_pq = no_both = 0
                 elif not has_p and not has_q:
                     no_both += 1
                     if no_both >= 5:
                         start = len(work_flag) - (no_both - 1)
                         for k in range(start, len(work_flag)):
                             work_flag[k] = False
-                        in_work = False; no_pq = no_both = 0
+                        in_work = False
+                        no_pq = no_both = 0
                 else:
                     no_pq = no_both = 0
             work_flag.append(in_work)
@@ -136,7 +138,8 @@ def clean_ppd(df: pd.DataFrame) -> pd.DataFrame:
                     last_p = row["p_cust"]
                 p_out.append(last_p)
             else:
-                last_p = 0.0; p_out.append(0.0)
+                last_p = 0.0
+                p_out.append(0.0)
         sub["p_cust"] = pd.Series(p_out, index=sub.index)
 
         # 2.4 Заполнение расхода внутри рабочего интервала
@@ -182,7 +185,8 @@ def clean_oil(df: pd.DataFrame) -> pd.DataFrame:
         miss, in_work = 0, False
         for is_raw in raw_flag:
             if not in_work and is_raw:
-                in_work = True; miss = 0
+                in_work = True
+                miss = 0
             elif in_work and not is_raw:
                 miss += 1
                 if miss >= 5:
@@ -190,7 +194,9 @@ def clean_oil(df: pd.DataFrame) -> pd.DataFrame:
                     start = len(work) - miss + 1
                     for i in range(start, len(work)):
                         work[i] = False
-                    in_work = False; miss = 0; continue
+                    in_work = False
+                    miss = 0
+                    continue
             else:
                 miss = 0
             work.append(in_work)
@@ -252,7 +258,8 @@ def _read_raw(path: Path, sheet_name: str) -> pd.DataFrame:
     df.columns = df.columns.str.replace("\u00A0", " ").str.strip()
     for col in df.columns:
         if re.search(r"(?i)дата", col):
-            df = df.rename(columns={col: "date"}); break
+            df = df.rename(columns={col: "date"})
+            break
     df["date"] = pd.to_datetime(df["date"], dayfirst=False, errors="coerce")
     return df
 
@@ -289,7 +296,8 @@ def load_oil(path: Path | str = OIL_FILE) -> pd.DataFrame:
     df = df.rename({c: RU2ENG_OIL[_ru(c)] for c in df.columns if _ru(c) in RU2ENG_OIL}, axis=1)
     for col in df.columns:
         if re.search(r"(?i)\(тм\)|раб", col):
-            df = df.rename(columns={col: "t_work"}); break
+            df = df.rename(columns={col: "t_work"})
+            break
     return df
 
 

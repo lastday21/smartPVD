@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple, List, Dict
+from typing import List, Dict
 
 import numpy as np
 import pandas as pd
@@ -61,7 +61,6 @@ def _merge_with_coords(coords: pd.DataFrame, wells: pd.Series, *, kind: str) -> 
     subset = pd.DataFrame({"well": wells})
     merged = subset.merge(coords[["well", "x", "y"]], on="well", how="inner")
 
-    missing = set(wells) - set(merged["well"])
     return merged
 
 

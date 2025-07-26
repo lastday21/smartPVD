@@ -29,7 +29,8 @@ def test_patch_cfg_temporary_change(monkeypatch):
     1. Подменить значение в config **на время контекста**.
     2. Вернуть исходное после выхода из with-блока.
     """
-    import config, correl
+    import config
+    import correl
 
     # добавляем тестовый атрибут в оба модуля
     monkeypatch.setattr(config, "TEST_PARAM", 0, raising=False)

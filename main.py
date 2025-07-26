@@ -35,7 +35,8 @@ from final_mix import run_final_mix
 DEBUG = True                  # сохранять промежуточные CSV
 final_filter_by_gt = True     # использовать ground_truth.csv
 
-CLEAN_DIR = Path("clean_data"); CLEAN_DIR.mkdir(exist_ok=True)
+CLEAN_DIR = Path("clean_data")
+CLEAN_DIR.mkdir(exist_ok=True)
 START_DIR = Path("start_data")
 
 # ───────────────────────────────────────────────────────────────────────
